@@ -48,8 +48,7 @@ class TestSpinnakerCommandFixture(BaseGitRepoTestFixture):
         'git_branch': EXTRA_REPO + '-branch',
 
         'spinnaker_version': 'NewSpinnakerVersion',
-        'github_filesystem_root': self.options.github_filesystem_root,
-        'github_hostname': self.options.github_hostname
+        'github_repository_root': self.options.github_repository_root,
     }
 
     registry = {}
@@ -69,14 +68,14 @@ class TestSpinnakerCommandFixture(BaseGitRepoTestFixture):
     command()
 
     base_git_dir = os.path.join(options.input_dir, 'new_release_branch')
-    self.assertEquals(os.listdir(base_git_dir), [EXTRA_REPO])
+    self.assertEqual(os.listdir(base_git_dir), [EXTRA_REPO])
     git_dir = os.path.join(base_git_dir, EXTRA_REPO)
-    self.assertEquals(
+    self.assertEqual(
         GitRunner(options).query_local_repository_commit_id(git_dir),
         self.repo_commit_map[EXTRA_REPO][EXTRA_REPO + '-branch'])
 
     mock_push_branch.assert_called_once_with(git_dir, 'NewSpinnakerVersion')
-    self.assertEquals(0, mock_push_tag.call_count)
+    self.assertEqual(0, mock_push_tag.call_count)
 
 
 if __name__ == '__main__':

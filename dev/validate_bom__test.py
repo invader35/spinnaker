@@ -80,6 +80,7 @@ from multiprocessing.pool import ThreadPool
 import atexit
 import collections
 import logging
+import math
 import os
 import re
 import subprocess
@@ -87,18 +88,27 @@ import socket
 import threading
 import time
 import traceback
-import urllib2
 import yaml
+
+try:
+  from urllib2 import urlopen, HTTPError, URLError
+except ImportError:
+  from urllib.request import urlopen
+  from urllib.error import HTTPError, URLError
+
 
 from buildtool import (
     add_parser_argument,
     determine_subprocess_outcome_labels,
+    check_subprocess,
     check_subprocesses_to_logfile,
     raise_and_log_error,
     ConfigError,
     ResponseError,
     TimeoutError,
     UnexpectedError)
+
+from validate_bom__deploy import replace_ha_services
 
 
 ForwardedPort = collections.namedtuple('ForwardedPort', ['child', 'port'])
@@ -318,24 +328,63 @@ class ValidateBomTestController(object):
       except Exception as ex:
         logging.error('Error terminating child: %s', ex)
 
+  def __collect_gce_quota(self, project, region,
+                          project_percent=100.0, region_percent=100.0):
+    project_info_json = check_subprocess('gcloud compute project-info describe'
+                                         ' --format yaml'
+                                         ' --project %s' % project)
+    project_info = yaml.safe_load(project_info_json)
+    # Sometimes gce returns entries and leaves out the a "metric" it was for.
+    # We'll ignore those and stick them in 'UNKNOWN' for simplicity.
+    project_quota = {'gce_global_%s' % info.get('metric', 'UNKNOWN'):
+                          int(max(1, math.floor(
+                              project_percent * (info['limit'] - info['usage']))))
+                     for info in project_info['quotas']}
+
+    region_info_json = check_subprocess('gcloud compute regions describe'
+                                        ' --format yaml'
+                                        ' %s' % region)
+    region_info = yaml.safe_load(region_info_json)
+    region_quota = {
+        'gce_region_%s' % info.get('metric', 'UNKNOWN'): int(max(
+            1, math.floor(region_percent * (info['limit'] - info['usage']))))
+        for info in region_info['quotas']
+    }
+    return project_quota, region_quota
+    
   def __init__(self, deployer):
     options = deployer.options
-    quota_spec = {
-        parts[0]: int(parts[1])
-        for parts in [entry.split('=')
-                      for entry in options.test_default_quota.split(',')]}
+    quota_spec = {}
+
+    if options.google_account_project:
+      project_quota, region_quota = self.__collect_gce_quota(
+          options.google_account_project, options.test_gce_quota_region,
+          project_percent=options.test_gce_project_quota_factor,
+          region_percent=options.test_gce_region_quota_factor)
+      quota_spec.update(project_quota)
+      quota_spec.update(region_quota)
+
+    if options.test_default_quota:
+      quota_spec.update({
+          parts[0].strip(): int(parts[1])
+          for parts in [entry.split('=')
+                        for entry in options.test_default_quota.split(',')]
+      })
+
     if options.test_quota:
       quota_spec.update(
-          {parts[0]: int(parts[1])
+          {parts[0].strip(): int(parts[1])
            for parts in [entry.split('=')
                          for entry in options.test_quota.split(',')]})
+
     self.__quota_tracker = QuotaTracker(quota_spec, deployer.metrics)
     self.__deployer = deployer
     self.__lock = threading.Lock()
     self.__passed = []  # Resulted in success
     self.__failed = []  # Resulted in failure
     self.__skipped = []  # Will not run at all
-    self.__test_suite = yaml.safe_load(file(options.test_profiles, 'r'))
+    with open(options.test_profiles, 'r') as fd:
+      self.__test_suite = yaml.safe_load(fd)
     self.__extra_test_bindings = (
         self.__load_bindings(options.test_extra_profile_bindings)
         if options.test_extra_profile_bindings
@@ -355,6 +404,9 @@ class ValidateBomTestController(object):
     self.__service_port_map = {
         # These are critical to most tests.
         'clouddriver': 7002,
+        'clouddriver-caching': 7002,
+        'clouddriver-rw': 7002,
+        'clouddriver-ro': 7002,
         'gate': 8084,
         'front50': 8080,
 
@@ -362,8 +414,19 @@ class ValidateBomTestController(object):
         'orca': 8083,
         'rosco': 8087,
         'igor': 8088,
-        'echo': 8089
+        'echo': 8089,
+        'echo-scheduler': 8089,
+        'echo-worker': 8089
     }
+
+  def __replace_ha_api_service(self, service, options):
+    transform_map = {}
+    if options.ha_clouddriver_enabled:
+      transform_map['clouddriver'] = 'clouddriver-rw'
+    if options.ha_echo_enabled:
+      transform_map['echo'] = ['echo-worker']
+
+    return transform_map.get(service, service)
 
   def __load_bindings(self, path):
     with open(path, 'r') as stream:
@@ -405,8 +468,8 @@ class ValidateBomTestController(object):
         while True:
           try:
             logging.info('KeepAlive %s polling', service_name)
-            got = urllib2.urlopen('http://localhost:{port}/health'
-                                  .format(port=local_port))
+            got = urlopen('http://localhost:{port}/health'
+                          .format(port=local_port))
             logging.info('KeepAlive %s -> %s', service_name, got.getcode())
           except Exception as ex:
             logging.info('KeepAlive %s -> %s', service_name, ex)
@@ -428,8 +491,8 @@ class ValidateBomTestController(object):
     logging.debug('Logging "%s" port forwarding to %s', service_name, logfile)
     child = subprocess.Popen(
         command,
-        stderr=stream,
-        stdout=None)
+        stderr=subprocess.STDOUT,
+        stdout=stream)
     return ForwardedPort(child, local_port)
 
   def build_summary(self):
@@ -504,18 +567,18 @@ class ValidateBomTestController(object):
         # localhost is hardcoded here because we are port forwarding.
         # timeout=20 is to appease kubectl port forwarding, which will close
         #            if left idle for 30s
-        urllib2.urlopen('http://localhost:{port}/health'
-                        .format(port=forwarding.port),
-                        timeout=20)
+        urlopen('http://localhost:{port}/health'
+                .format(port=forwarding.port),
+                timeout=20)
         logging.info('"%s" is ready on port %d | %s',
                      service_name, forwarding.port, threadid)
         return forwarding
-      except urllib2.HTTPError as error:
+      except HTTPError as error:
         logging.warning('%s got %s. Ignoring that for now.',
                         service_name, error)
         return forwarding
 
-      except (urllib2.URLError, Exception) as error:
+      except (URLError, Exception) as error:
         if time.time() >= end_time:
           logging.error(
               'Timing out waiting for %s | %s', service_name, threadid)
@@ -688,8 +751,10 @@ class ValidateBomTestController(object):
                                   'IncompatableConfig', metric_labels)
         return False
 
-    services = set(requires.pop('services', []))
-    services.add(spec.pop('api'))
+    services = set(replace_ha_services(
+        requires.pop('services', []), self.options))
+    services.add(self.__replace_ha_api_service(
+        spec.pop('api'), self.options))
 
     if requires:
       raise_and_log_error(
@@ -770,7 +835,7 @@ class ValidateBomTestController(object):
       This does not consider quota, which is checked later.
     """
     options = self.options
-    microservice_api = spec.get('api')
+    microservice_api = self.__replace_ha_api_service(spec.get('api'), options)
     test_rel_path = spec.pop('path', None) or os.path.join(
         'citest', 'tests', '{0}.py'.format(test_name))
     args = spec.pop('args', {})
@@ -799,7 +864,7 @@ class ValidateBomTestController(object):
         '--native_port', str(self.__forwarded_ports[microservice_api].port)
     ]
     if options.test_stack:
-      command.extend(['--test_stack', options.test_stack])
+      command.extend(['--test_stack', str(options.test_stack)])
 
     self.add_extra_arguments(test_name, args, command)
     return command
@@ -908,15 +973,31 @@ def init_argument_parser(parser, defaults):
       help='Number of seconds to permit services to startup before giving up.')
 
   add_parser_argument(
+      parser, 'test_gce_project_quota_factor', defaults, 1.0, type=float,
+      help='Default percentage of available project quota to make available'
+           ' for tests.')
+
+  add_parser_argument(
+      parser, 'test_gce_region_quota_factor', defaults, 1.0, type=float,
+      help='Default percentage of available region quota to make available'
+           ' for tests.')
+
+  add_parser_argument(
+      parser, 'test_gce_quota_region', defaults, 'us-central1',
+      help='GCE Compute Region to gather region quota limits from.')
+
+  add_parser_argument(
       parser, 'test_default_quota',
-      defaults, 'google_backend_services=5,google_forwarding_rules=10'
-                ',google_ssl_certificates=5,google_cpu=20'
-                ',appengine_deployment=1',
-      help='Comma-delimited name=value list of quota limits. This is used'
-           ' to rate-limit tests based on their profiled quota specifications.')
+      defaults, '',
+      help='Default quota parameters for values used in the --test_profiles.'
+           ' This does not include GCE quota values, which are determined'
+           ' at runtime. These value can be further overriden by --test_quota.'
+           ' These are meant as built-in defaults, where --test_quota as'
+           ' per-execution overriden.')
+
   add_parser_argument(
       parser, 'test_quota', defaults, '',
-      help='Comma-delimited name=value list of --test_default_quota overrides.')
+      help='Comma-delimited name=value list of quota overrides.')
 
   add_parser_argument(
       parser, 'testing_enabled', defaults, True, type=bool,
@@ -941,6 +1022,10 @@ def init_argument_parser(parser, defaults):
            ' Spinnaker application "stack" to use. This is typically'
            ' to help trace the source of resources created within the'
            ' tests.')
+
+  add_parser_argument(
+      parser, 'test_jenkins_job_name', defaults, 'TriggerBake',
+      help='The Jenkins job name to use in tests.')
 
 
 def validate_options(options):

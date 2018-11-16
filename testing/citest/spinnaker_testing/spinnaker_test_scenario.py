@@ -32,9 +32,11 @@ from spinnaker_testing import aws_scenario_support
 from spinnaker_testing import appengine_scenario_support
 from spinnaker_testing import google_scenario_support
 from spinnaker_testing import kubernetes_scenario_support
+from spinnaker_testing import kubernetes_v2_scenario_support
 from spinnaker_testing import openstack_scenario_support
 from spinnaker_testing import azure_scenario_support
 from spinnaker_testing import dcos_scenario_support
+
 
 PLATFORM_SUPPORT_CLASSES = [
     aws_scenario_support.AwsScenarioSupport,
@@ -42,6 +44,7 @@ PLATFORM_SUPPORT_CLASSES = [
     google_scenario_support.GoogleScenarioSupport,
     appengine_scenario_support.AppEngineScenarioSupport,
     kubernetes_scenario_support.KubernetesScenarioSupport,
+    kubernetes_v2_scenario_support.KubernetesV2ScenarioSupport,
     openstack_scenario_support.OpenStackScenarioSupport,
     azure_scenario_support.AzureScenarioSupport,
     dcos_scenario_support.DcosScenarioSupport
@@ -57,7 +60,7 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
   ENDPOINT_SUBSYSTEM = 'the server to test'
 
   @classmethod
-  def new_post_operation(cls, title, data, path, status_class=None):
+  def new_post_operation(cls, title, data, path, **kwargs):
     """Creates an operation that posts data to the given path when executed.
 
     The base_url will come from the agent that the operation is eventually
@@ -67,14 +70,13 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
       title: [string] The name of the operation for reporting purposes.
       data: [string] The payload to send in the HTTP POST.
       path: [string] The path relative to the base url provided later.
-      status_class: [class AgentOperationStatus] If provided, a specialization
-         of the AgentOperationStatus to use for tracking the execution.
+      kwargs: [kwargs] Additional kwargs for HttpPostOperation
     """
     return http_agent.HttpPostOperation(title=title, data=data, path=path,
-                                        status_class=status_class)
+                                        **kwargs)
 
   @classmethod
-  def new_put_operation(cls, title, data, path, status_class=None):
+  def new_put_operation(cls, title, data, path, **kwargs):
     """Creates an operation that puts data to the given path when executed.
 
     The base_url will come from the agent that the operation is eventually
@@ -84,14 +86,13 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
       title: [string] The name of the operation for reporting purposes.
       data: [string] The payload to send in the HTTP PUT.
       path: [string] The path relative to the base url provided later.
-      status_class: [class AgentOperationStatus] If provided, a specialization
-         of the AgentOperationStatus to use for tracking the execution.
+      kwargs: [kwargs] Additional kwargs for HttpPutOperation
     """
     return http_agent.HttpPutOperation(title=title, data=data, path=path,
-                                       status_class=status_class)
+                                       **kwargs)
 
   @classmethod
-  def new_patch_operation(cls, title, data, path, status_class=None):
+  def new_patch_operation(cls, title, data, path, **kwargs):
     """Creates an operation that patches data to the given path when executed.
 
     The base_url will come from the agent that the operation is eventually
@@ -101,14 +102,13 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
       title: [string] The name of the operation for reporting purposes.
       data: [string] The payload to send in the HTTP PATCH.
       path: [string] The path relative to the base url provided later.
-      status_class: [class AgentOperationStatus] If provided, a specialization
-         of the AgentOperationStatus to use for tracking the execution.
+      kwargs: [kwargs] Additional kwargs for HttpPatchOperation
     """
     return http_agent.HttpPatchOperation(title=title, data=data, path=path,
-                                         status_class=status_class)
+                                         **kwargs)
 
   @classmethod
-  def new_delete_operation(cls, title, data, path, status_class=None):
+  def new_delete_operation(cls, title, data, path, **kwargs):
     """Creates an operation that deletes from the given path when executed.
 
     The base_url will come from the agent that the operation is eventually
@@ -118,11 +118,10 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
       title: [string] The name of the operation for reporting purposes.
       data: [string] The payload to send in the HTTP DELETE.
       path: [string] The path relative to the base url provided later.
-      status_class: [class AgentOperationStatus] If provided, a specialization
-         of the AgentOperationStatus to use for tracking the execution.
+      kwargs: [kwargs] Additional kwargs for HttpDeleteOperation
     """
     return http_agent.HttpDeleteOperation(title=title, data=data, path=path,
-                                          status_class=status_class)
+                                          **kwargs)
 
   @classmethod
   def _init_spinnaker_bindings_builder(cls, builder, defaults):
@@ -205,6 +204,15 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
     return self.__platform_support['kubernetes'].observer
 
   @property
+  def kube_v2_observer(self):
+    """The observer for inspecting Kubernetes V2 platform state."
+
+    Raises:
+      Exception if the observer is not available.
+    """
+    return self.__platform_support['kubernetes_v2'].observer
+
+  @property
   def aws_observer(self):
     """The observer for inspecting AWS platform state.
 
@@ -258,6 +266,7 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
       agent: [SpinnakerAgent] The Spinnaker agent to bind to the scenario.
     """
     super(SpinnakerTestScenario, self).__init__(bindings, agent)
+    self.__google_resource_analyzer = None
     agent = self.agent
     bindings = self.bindings
 
@@ -280,7 +289,7 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
         self.__platform_support[support.platform_name] = support
       except:
         logger = logging.getLogger(__name__)
-        
+
         logger.exception('Failed to initialize support class %s:\n%s',
                          str(klas), traceback.format_exc())
 
@@ -296,3 +305,38 @@ class SpinnakerTestScenario(sk.AgentTestScenario):
   def _do_init_bindings(self):
     """Hook for specific tests to add additional bindings."""
     pass
+
+  def pre_run_hook(self, test_case, context):
+    if not self.bindings.get('RECORD_GCP_RESOURCE_USAGE'):
+      return None
+
+    if self.__google_resource_analyzer is None:
+      from google_scenario_support import GcpResourceUsageAnalyzer
+      self.__google_resource_analyzer = GcpResourceUsageAnalyzer(self)
+    analyzer = self.__google_resource_analyzer
+
+    scanner = analyzer.make_gcp_api_scanner(
+        self.bindings.get('GOOGLE_ACCOUNT_PROJECT'),
+        self.bindings.get('GOOGLE_CREDENTIALS_PATH'),
+        include_apis=['compute'],
+        exclude_apis=['compute.*Operations'])
+    JournalLogger.begin_context('Capturing initial quota usage')
+    try:
+      usage = analyzer.collect_resource_usage(self.gcp_observer, scanner)
+    finally:
+      JournalLogger.end_context()
+    return (scanner, usage)
+
+  def post_run_hook(self, info, test_case, context):
+    if not info:
+      return
+
+    scanner, before_usage = info
+    analyzer = self.__google_resource_analyzer
+    JournalLogger.begin_context('Capturing final quota usage')
+    try:
+      after_usage = analyzer.collect_resource_usage(self.gcp_observer, scanner)
+    finally:
+      JournalLogger.end_context()
+    analyzer.log_delta_resource_usage(
+        test_case, scanner, before_usage, after_usage)

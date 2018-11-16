@@ -96,7 +96,7 @@ def __load_defaults_from_path(path, visited=None):
   visited.append(path)
 
   with open(path, 'r') as f:
-    defaults = yaml.load(f)
+    defaults = yaml.safe_load(f)
 
     # Allow these files to be recursive
     # So that there can be some overall default file
@@ -177,11 +177,16 @@ def add_monitoring_context_labels(options):
         version_name = bom_name[:bom_name.find('-latest')]
       else:
         version_name = bom_name[:bom_name.rfind('-')]
+
   if version_name:
-    context_labels = 'version=' + version_name
+    context_labels = ['version=' + version_name]
+    if (version_name == 'master'
+        or version_name.startswith('release-')
+        or version_name.startswith('master-latest-')):
+      context_labels.append('official_version='+version_name)
     if options.monitoring_context_labels:
-      context_labels += ',' + options.monitoring_context_labels
-    options.monitoring_context_labels = context_labels
+      context_labels.append(options.monitoring_context_labels)
+    options.monitoring_context_labels = ','.join(context_labels)
 
 
 def init_options_and_registry(args, command_modules):
@@ -238,6 +243,7 @@ def main():
           'source',
           'spinnaker',
           'inspection',
+          'spin',
       ]]
 
   GitRunner.stash_and_clear_auth_env_vars()
@@ -252,7 +258,7 @@ def main():
 
   logging.debug(
       'Running with options:\n   %s',
-      '\n   '.join(yaml.dump(vars(options), default_flow_style=False)
+      '\n   '.join(yaml.safe_dump(vars(options), default_flow_style=False)
                    .split('\n')))
 
   factory = command_registry.get(options.command)

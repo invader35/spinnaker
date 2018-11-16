@@ -54,8 +54,15 @@ import json
 import logging
 import os
 import re
-import urllib2
+import sys
 import yaml
+
+try:
+  from urllib2 import urlopen, HTTPError, Request
+except ImportError:
+  from urllib.request import urlopen, Request
+  from urllib.error import HTTPError
+
 
 from buildtool import (
     CommandFactory,
@@ -64,6 +71,7 @@ from buildtool import (
     check_options_set,
     check_path_exists,
     check_subprocess,
+    exception_to_message,
     maybe_log_exception,
     raise_and_log_error,
     write_to_path,
@@ -75,7 +83,9 @@ from buildtool import (
 def my_unicode_representer(self, data):
   return self.represent_str(data.encode('utf-8'))
 
-yaml.representer.Representer.add_representer(unicode, my_unicode_representer)
+if sys.version_info[0] == 2:
+  yaml.representer.Representer.add_representer(unicode, my_unicode_representer)
+
 yaml.Dumper.ignore_aliases = lambda *args: True
 
 
@@ -144,9 +154,9 @@ class CollectBomVersions(CommandProcessor):
     logging.debug('Loading %s', url)
     try:
       text = check_subprocess('gsutil cat ' + url)
-      return yaml.load(text)
+      return yaml.safe_load(text)
     except Exception as ex:
-      self.__bad_files[self.url_to_bom_name(url)] = ex.message
+      self.__bad_files[self.url_to_bom_name(url)] = exception_to_message(ex)
       maybe_log_exception('load_from_from_url', ex,
                           action_msg='Skipping %s' % url)
       return None
@@ -236,7 +246,8 @@ class CollectBomVersions(CommandProcessor):
         raise_and_log_error(UnexpectedError(message))
       self.analyze_bom(bom)
     except Exception as ex:
-      self.__bad_files[self.url_to_bom_name(line.strip())] = ex.message
+      self.__bad_files[self.url_to_bom_name(line.strip())] = (
+          exception_to_message(ex))
       maybe_log_exception('analyze_bom', ex,
                           action_msg='Skipping %s' % line)
 
@@ -315,7 +326,7 @@ class CollectBomVersions(CommandProcessor):
 
     path = os.path.join(self.get_output_dir(), 'all_bom_service_map.yml')
     logging.info('Writing bom analysis to %s', path)
-    write_to_path(yaml.dump(result_map, default_flow_style=False), path)
+    write_to_path(yaml.safe_dump(result_map, default_flow_style=False), path)
 
     partition_names = ['released', 'unreleased']
     partitions = self.partition_service_map(result_map)
@@ -323,26 +334,29 @@ class CollectBomVersions(CommandProcessor):
       path = os.path.join(self.get_output_dir(),
                           partition_names[index] + '_bom_service_map.yml')
       logging.info('Writing bom analysis to %s', path)
-      write_to_path(yaml.dump(data, default_flow_style=False), path)
+      write_to_path(yaml.safe_dump(data, default_flow_style=False), path)
 
     if self.__bad_files:
       path = os.path.join(self.get_output_dir(), 'bad_boms.txt')
       logging.warning('Writing %d bad URLs to %s', len(self.__bad_files), path)
-      write_to_path(yaml.dump(self.__bad_files, default_flow_style=False), path)
+      write_to_path(
+          yaml.safe_dump(self.__bad_files, default_flow_style=False),
+          path)
 
     if self.__non_standard_boms:
       path = os.path.join(self.get_output_dir(), 'nonstandard_boms.txt')
       logging.warning('Writing %d nonstandard boms to %s',
                       len(self.__non_standard_boms), path)
       write_to_path(
-          yaml.dump(self.__non_standard_boms, default_flow_style=False), path)
+          yaml.safe_dump(self.__non_standard_boms, default_flow_style=False),
+          path)
 
     config = {
         'halyard_bom_bucket': options.halyard_bom_bucket
     }
     path = os.path.join(self.get_output_dir(), 'config.yml')
     logging.info('Writing to %s', path)
-    write_to_path(yaml.dump(config, default_flow_style=False), path)
+    write_to_path(yaml.safe_dump(config, default_flow_style=False), path)
 
   def partition_service_map(self, result_map):
     def partition_info_list(info_list):
@@ -462,19 +476,19 @@ class CollectArtifactVersions(CommandProcessor):
       self.__basic_auth = None
 
   def fetch_bintray_url(self, bintray_url):
-    request = urllib2.Request(bintray_url)
+    request = Request(bintray_url)
     if self.__basic_auth:
       request.add_header('Authorization', self.__basic_auth)
     try:
-      response = urllib2.urlopen(request)
+      response = urlopen(request)
       headers = response.info()
       payload = response.read()
       content = json.JSONDecoder(encoding='utf-8').decode(payload)
-    except urllib2.HTTPError as ex:
+    except HTTPError as ex:
       raise_and_log_error(
           ResponseError('Bintray failure: {}'.format(ex),
                         server='bintray.api'),
-          'Failed on url=%s: %s' % (bintray_url, ex.message))
+          'Failed on url=%s: %s' % (bintray_url, exception_to_message(ex)))
     except Exception as ex:
       raise
     return headers, content
@@ -566,9 +580,9 @@ class CollectArtifactVersions(CommandProcessor):
           self.get_output_dir(),
           '%s__%s_versions.yml' % (bintray_repo, repo_type))
       logging.info('Writing %s versions to %s', bintray_repo, path)
-      write_to_path(yaml.dump(package_map,
-                              allow_unicode=True,
-                              default_flow_style=False), path)
+      write_to_path(yaml.safe_dump(package_map,
+                                   allow_unicode=True,
+                                   default_flow_style=False), path)
     return results[0], results[1]
 
   def query_gcr_image_versions(self, image):
@@ -609,9 +623,9 @@ class CollectArtifactVersions(CommandProcessor):
         self.get_output_dir(),
         options.docker_registry.replace('/', '__') + '__gcb_versions.yml')
     logging.info('Writing %s versions to %s', options.docker_registry, path)
-    write_to_path(yaml.dump(image_map,
-                            allow_unicode=True,
-                            default_flow_style=False), path)
+    write_to_path(yaml.safe_dump(image_map,
+                                 allow_unicode=True,
+                                 default_flow_style=False), path)
     return image_map
 
   def collect_gce_image_versions(self):
@@ -646,9 +660,9 @@ class CollectArtifactVersions(CommandProcessor):
     path = os.path.join(
         self.get_output_dir(), project + '__gce_image_versions.yml')
     logging.info('Writing gce image versions to %s', path)
-    write_to_path(yaml.dump(image_map,
-                            allow_unicode=True,
-                            default_flow_style=False), path)
+    write_to_path(yaml.safe_dump(image_map,
+                                 allow_unicode=True,
+                                 default_flow_style=False), path)
     return image_map
 
   def _do_command(self):
@@ -673,7 +687,8 @@ class CollectArtifactVersions(CommandProcessor):
       path = os.path.join(self.get_output_dir(), 'missing_%s.yml' % which[0])
       logging.info('Writing to %s', path)
       write_to_path(
-          yaml.dump(which[1], allow_unicode=True, default_flow_style=False),
+          yaml.safe_dump(which[1], allow_unicode=True,
+                         default_flow_style=False),
           path)
 
     config = {
@@ -685,7 +700,7 @@ class CollectArtifactVersions(CommandProcessor):
     }
     path = os.path.join(self.get_output_dir(), 'config.yml')
     logging.info('Writing to %s', path)
-    write_to_path(yaml.dump(config, default_flow_style=False), path)
+    write_to_path(yaml.safe_dump(config, default_flow_style=False), path)
 
 
 class CollectArtifactVersionsFactory(CommandFactory):
@@ -777,13 +792,13 @@ class AuditArtifactVersions(CommandProcessor):
 
     logging.debug('Loading container image versions from "%s"', gcr_paths[0])
     with open(gcr_paths[0], 'r') as stream:
-      self.__container_versions = yaml.load(stream.read())
+      self.__container_versions = yaml.safe_load(stream.read())
     with open(jar_paths[0], 'r') as stream:
-      self.__jar_versions = yaml.load(stream.read())
+      self.__jar_versions = yaml.safe_load(stream.read())
     with open(debian_paths[0], 'r') as stream:
-      self.__debian_versions = yaml.load(stream.read())
+      self.__debian_versions = yaml.safe_load(stream.read())
     with open(image_paths[0], 'r') as stream:
-      self.__gce_image_versions = yaml.load(stream.read())
+      self.__gce_image_versions = yaml.safe_load(stream.read())
 
   def __extract_all_bom_versions(self, bom_map):
     result = set([])
@@ -797,25 +812,91 @@ class AuditArtifactVersions(CommandProcessor):
               result.add(info['bom_version'])
     return result
 
+  def __remove_old_bom_versions(self, min_semver, version_to_commit_boms):
+    """Remove references to older boms in collected bom info.
+
+    Args:
+      min_semver: [SemanticVersion] minimally acceptable semantic version
+      version_to_commit_boms: [dict of {commit_id, build_info}]
+         where build_info is a dictionary mapping buildnum to list of
+         bom_metadata dictionaries.
+
+    Returns:
+      copy of versions but without build_info referencing older bom_versions.
+    """
+    def list_of_current_bom_meta(min_semver, all_bom_meta):
+      good_bom_meta = []
+      for bom_meta in all_bom_meta:
+        semver = SemanticVersion.make('ignored-' + bom_meta['bom_version'])
+        if SemanticVersion.compare(semver, min_semver) >= 0:
+          good_bom_meta.append(bom_meta)
+      return good_bom_meta
+
+    def commit_to_current_bom_meta(min_semver, build_map):
+      build_info = {}
+      for buildnum, all_bom_meta in build_map.items():
+        good_bom_meta = list_of_current_bom_meta(min_semver, all_bom_meta)
+        if good_bom_meta:
+          build_info[buildnum] = good_bom_meta
+      return build_info
+
+    result = {}
+    for version, commit_build_map in version_to_commit_boms.items():
+      commit_map = {}
+      for commit_id, orig_build_map in commit_build_map.items():
+        build_map = commit_to_current_bom_meta(min_semver, orig_build_map)
+        if build_map:
+          commit_map[commit_id] = build_map
+      if commit_map:
+        result[version] = commit_map
+      else:
+        logging.info(
+            'Dropping version=%s because it bom versions are all too old.',
+            version)
+    return result
+
   def __init__(self, factory, options, **kwargs):
+    if options.prune_min_buildnum_prefix is not None:
+      # Typically numeric so is interpreted as number from yaml
+      options.prune_min_buildnum_prefix = str(options.prune_min_buildnum_prefix)
+
     super(AuditArtifactVersions, self).__init__(factory, options, **kwargs)
     base_path = os.path.dirname(self.get_output_dir())
     self.__init_bintray_versions_helper(base_path)
+
+    min_version = options.min_audit_bom_version or '0.0.0'
+    min_parts = min_version.split('.')
+    if len(min_parts) < 3:
+      min_version += '.0' * (3 - len(min_parts))
+    self.__min_semver = SemanticVersion.make('ignored-' + min_version)
 
     bom_data_dir = os.path.join(base_path, 'collect_bom_versions')
     path = os.path.join(bom_data_dir, 'released_bom_service_map.yml')
     check_path_exists(path, 'released bom analysis')
     with open(path, 'r') as stream:
-      self.__released_boms = yaml.load(stream.read())
+      self.__all_released_boms = {}      # forever
+      self.__current_released_boms = {}  # since min_version to audit
+      for service, versions in yaml.safe_load(stream.read()).items():
+        if not versions:
+          # e.g. this service has not yet been released.
+          logging.info('No versions for service=%s', service)
+          continue
+
+        self.__all_released_boms[service] = versions
+        self.__current_released_boms[service] = versions
+        stripped_versions = self.__remove_old_bom_versions(
+            self.__min_semver, versions)
+        if stripped_versions:
+          self.__current_released_boms[service] = stripped_versions
 
     path = os.path.join(bom_data_dir, 'unreleased_bom_service_map.yml')
     check_path_exists(path, 'unreleased bom analysis')
     with open(path, 'r') as stream:
-      self.__unreleased_boms = yaml.load(stream.read())
+      self.__unreleased_boms = yaml.safe_load(stream.read())
 
     self.__only_bad_and_invalid_boms = False
     self.__all_bom_versions = self.__extract_all_bom_versions(
-        self.__released_boms)
+        self.__all_released_boms)
     self.__all_bom_versions.update(
         self.__extract_all_bom_versions(self.__unreleased_boms))
 
@@ -841,7 +922,7 @@ class AuditArtifactVersions(CommandProcessor):
     self.__invalid_versions = {}
 
   def audit_artifacts(self):
-    self.audit_bom_services(self.__released_boms, 'released')
+    self.audit_bom_services(self.__all_released_boms, 'released')
     self.audit_bom_services(self.__unreleased_boms, 'unreleased')
     self.audit_package(
         'jar', self.__jar_versions, self.__unused_jars)
@@ -859,18 +940,30 @@ class AuditArtifactVersions(CommandProcessor):
       path = os.path.join(self.get_output_dir(), 'audit_' + what + '.yml')
       logging.info('Writing %s', path)
       write_to_path(
-          yaml.dump(data, allow_unicode=True, default_flow_style=False),
+          yaml.safe_dump(data, allow_unicode=True, default_flow_style=False),
           path)
 
     confirmed_boms = self.__all_bom_versions - set(self.__invalid_boms.keys())
+    unchecked_releases = [
+        key
+        for key in self.__all_bom_versions
+        if (CollectBomVersions.RELEASED_VERSION_MATCHER.match(key)
+            and SemanticVersion.compare(SemanticVersion.make('ignored-' + key),
+                                        self.__min_semver) < 0)]
+
     invalid_releases = {
         key: bom
         for key, bom in self.__invalid_boms.items()
-        if CollectBomVersions.RELEASED_VERSION_MATCHER.match(key)}
+        if (CollectBomVersions.RELEASED_VERSION_MATCHER.match(key)
+            and SemanticVersion.compare(SemanticVersion.make('ignored-' + key),
+                                        self.__min_semver) >= 0)}
     confirmed_releases = [
         key
         for key in confirmed_boms
-        if CollectBomVersions.RELEASED_VERSION_MATCHER.match(key)]
+        if (CollectBomVersions.RELEASED_VERSION_MATCHER.match(key)
+            and SemanticVersion.compare(SemanticVersion.make('ignored-' + key),
+                                        self.__min_semver) >= 0)]
+
     maybe_write_log('missing_debians', self.__missing_debians)
     maybe_write_log('missing_jars', self.__missing_jars)
     maybe_write_log('missing_containers', self.__missing_containers)
@@ -888,6 +981,7 @@ class AuditArtifactVersions(CommandProcessor):
     maybe_write_log('confirmed_releases', sorted(list(confirmed_releases)))
     maybe_write_log('invalid_versions', self.__invalid_versions)
     maybe_write_log('invalid_releases', invalid_releases)
+    maybe_write_log('unchecked_releases', unchecked_releases)
 
   def most_recent_version(self, name, versions):
     """Find the most recent version built."""
@@ -971,11 +1065,11 @@ class AuditArtifactVersions(CommandProcessor):
     path = os.path.join(os.path.dirname(self.get_output_dir()),
                         'collect_bom_versions', 'config.yml')
     with open(path, 'r') as stream:
-      bom_config = yaml.load(stream.read())
+      bom_config = yaml.safe_load(stream.read())
     path = os.path.join(os.path.dirname(self.get_output_dir()),
                         'collect_artifact_versions', 'config.yml')
     with open(path, 'r') as stream:
-      art_config = yaml.load(stream.read())
+      art_config = yaml.safe_load(stream.read())
 
     if self.__prune_boms:
       path = os.path.join(self.get_output_dir(), 'prune_boms.txt')
@@ -1056,6 +1150,15 @@ class AuditArtifactVersions(CommandProcessor):
       self.__found_images[service] = holder
       return True
 
+    # 20181109: Dont audit images as these are no longer built
+    #           so are not expected anyway.
+    #
+    expect_images = False
+    if not expect_images:
+      return True
+
+    # 20181109: We're leaving this around for the time being
+    #           but it isnt reachable.
     holder = self.__missing_images.get(service, {})
     holder[build_version] = entries
     self.__missing_images[service] = holder
@@ -1117,7 +1220,7 @@ class AuditArtifactVersions(CommandProcessor):
     return False
 
   def audit_package_helper(self, package, version, buildnum, which):
-    if package in self.__released_boms or package in self.__unreleased_boms:
+    if package in self.__all_released_boms or package in self.__unreleased_boms:
       name = package
     elif package.startswith('spinnaker-'):
       name = package[package.find('-') + 1:]
@@ -1125,7 +1228,7 @@ class AuditArtifactVersions(CommandProcessor):
       return False
 
     is_released = self.package_in_bom_map(
-        name, version, buildnum, self.__released_boms)
+        name, version, buildnum, self.__all_released_boms)
     is_unreleased = self.package_in_bom_map(
         name, version, buildnum, self.__unreleased_boms)
     if is_released or is_unreleased:
@@ -1180,6 +1283,7 @@ class AuditArtifactVersions(CommandProcessor):
             deb_ok = self.audit_debian(service, version_buildnum, info_list)
             gcr_ok = self.audit_container(service, version_buildnum, info_list)
             image_ok = self.audit_image(service, version_buildnum, info_list)
+
             add_invalid_boms(jar_ok, deb_ok, gcr_ok, image_ok,
                              service, version_buildnum,
                              info_list, self.__invalid_boms)
@@ -1200,6 +1304,8 @@ class AuditArtifactVersionsFactory(CommandFactory):
 
   def init_argparser(self, parser, defaults):
     super(AuditArtifactVersionsFactory, self).init_argparser(parser, defaults)
+    self.add_argument(parser, 'min_audit_bom_version', defaults, None,
+                      help='Minimum released bom version to audit.')
     self.add_argument(
         parser, 'prune_min_buildnum_prefix', defaults, None,
         help='Only suggest pruning artifacts with a smaller build number.'

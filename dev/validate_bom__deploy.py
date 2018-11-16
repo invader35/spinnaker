@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import traceback
@@ -45,12 +46,42 @@ from buildtool import (
 
 
 SUPPORTED_DEPLOYMENT_TYPES = ['localdebian', 'distributed']
-SUPPORTED_DISTRIBUTED_PLATFORMS = ['kubernetes']
+SUPPORTED_DISTRIBUTED_PLATFORMS = ['kubernetes', 'kubernetes_v2']
 HALYARD_SERVICES = ['halyard']
 SPINNAKER_SERVICES = [
     'clouddriver', 'echo', 'fiat', 'front50', 'gate', 'igor', 'orca',
-    'rosco'
+    'rosco', 'kayenta', 'monitoring'
 ]
+
+
+def decode_json(data):
+  try:
+    return json.JSONDecoder().decode(data)
+  except (ValueError, TypeError) as err:
+    logging.error('Error decoding JSON: %s\n%s\n',
+                  err.message, data)
+    raise
+
+
+def replace_ha_services(services, options):
+  """Replace services with their HA services.
+
+  Given a list of services and options, return a new list of services where
+  services that are enabled for HA are replaced with their HA counterparts.
+  """
+
+  transform_map = {}
+  if options.ha_clouddriver_enabled:
+    transform_map['clouddriver'] = \
+        ['clouddriver-caching', 'clouddriver-rw', 'clouddriver-ro']
+  if options.ha_echo_enabled:
+    transform_map['echo'] = \
+        ['echo-scheduler', 'echo-worker']
+
+  transformed_services = []
+  for service in services:
+    transformed_services.extend(transform_map.get(service, [service]))
+  return transformed_services
 
 
 def ensure_empty_ssh_key(path, user):
@@ -91,7 +122,7 @@ def write_data_to_secure_path(data, path=None, is_script=False):
   maybe_executable = stat.S_IXUSR if is_script else 0
   flags = stat.S_IRUSR | stat.S_IWUSR | maybe_executable
   os.fchmod(fd, flags)
-  os.write(fd, data)
+  os.write(fd, data.encode('utf-8'))
   os.close(fd)
   return path
 
@@ -255,7 +286,7 @@ class BaseValidateBomDeployer(object):
             message, os.path.join(log_dir, service + '.log'))
 
     logging.info('Collecting server log files into "%s"', log_dir)
-    all_services = list(SPINNAKER_SERVICES)
+    all_services = replace_ha_services(SPINNAKER_SERVICES, self.options)
     all_services.extend(HALYARD_SERVICES)
     thread_pool = ThreadPool(len(all_services))
     thread_pool.map(fetch_service_log, all_services)
@@ -357,6 +388,12 @@ class BaseValidateBomDeployer(object):
       if options.injected_deploy_spinnaker_account:
         type_args.extend(['--account-name',
                           options.injected_deploy_spinnaker_account])
+      if options.deploy_distributed_platform == 'kubernetes':
+        script.append('hal -q --log=info config deploy edit --location {namespace}'
+            .format(namespace=self.options.deploy_k8s_namespace))
+      elif options.deploy_distributed_platform == 'kubernetes_v2':
+        script.append('hal -q --log=info config deploy edit --location {namespace}'
+            .format(namespace=self.options.deploy_k8s_v2_namespace))
 
     script.append('hal -q --log=info config deploy edit {args}'
                   .format(args=' '.join(type_args)))
@@ -472,22 +509,169 @@ class KubernetesValidateBomDeployer(BaseValidateBomDeployer):
       service: [string] The service's log to get
       log_dir: [string] The directory name to write the logs into.
     """
+    if service == 'monitoring':
+      # monitoring is in a sidecar of each service
+      return
+
     options = self.options
     k8s_namespace = options.deploy_k8s_namespace
     service_pod = self.__get_pod_name(k8s_namespace, service)
-    path = os.path.join(log_dir, service + '.log')
-    write_data_to_secure_path('', path)
-    check_subprocess(
-        'kubectl -n {namespace} -c {container} {context} logs {pod}'
-        '  >> {path}'
-        .format(namespace=k8s_namespace,
-                container='spin-{service}'.format(service=service),
-                context=('--context {0}'.format(options.k8s_account_context)
-                         if options.k8s_account_context
-                         else ''),
-                pod=service_pod,
-                path=path),
+
+    containers = ['spin-' + service]
+    if options.monitoring_install_which:
+      containers.append('spin-monitoring-daemon')
+
+    for container in containers:
+      if container == 'spin-monitoring-daemon':
+        path = os.path.join(log_dir, service + '_monitoring.log')
+      else:
+        path = os.path.join(log_dir, service + '.log')
+      retcode, stdout = run_subprocess(
+          'kubectl -n {namespace} -c {container} {context} logs {pod}'
+          .format(namespace=k8s_namespace,
+                  container=container,
+                  context=('--context {0}'.format(options.k8s_account_context)
+                           if options.k8s_account_context
+                           else ''),
+                  pod=service_pod),
+          shell=True)
+      write_data_to_secure_path(stdout, path)
+
+
+class KubernetesV2ValidateBomDeployer(BaseValidateBomDeployer):
+  """Concrete deployer used to deploy Hal onto Google Cloud Platform.
+
+  This class is not intended to be constructed directly. Instead see the
+  free function make_deployer() in this module.
+  """
+  def __init__(self, options, metrics, **kwargs):
+    super(KubernetesV2ValidateBomDeployer, self).__init__(
+        options, metrics, **kwargs)
+
+  @classmethod
+  def init_platform_argument_parser(cls, parser, defaults):
+    """Adds custom configuration parameters to argument parser.
+
+    This is a helper function for the free function init_argument_parser().
+    """
+    add_parser_argument(
+        parser, 'deploy_k8s_v2_namespace', defaults, 'spinnaker',
+        help='Namespace for the account Spinnaker is deployed into.')
+
+  @classmethod
+  def validate_options_helper(cls, options):
+    """Adds custom configuration parameters to argument parser.
+
+    This is a helper function for make_deployer().
+    """
+    if options.deploy_distributed_platform != 'kubernetes_v2':
+      return
+
+    if not options.k8s_v2_account_name:
+      raise_and_log_error(
+          ConfigError('--deploy_distributed_platform="kubernetes_v2" requires'
+                      ' a --k8s_v2_account_name be configured.'))
+
+    if hasattr(options, "injected_deploy_spinnaker_account"):
+      raise_and_log_error(
+          UnexpectedError('deploy_spinnaker_account was already set to "{0}"'
+                          .format(options.injected_deploy_spinnaker_account)))
+    options.injected_deploy_spinnaker_account = options.k8s_v2_account_name
+
+  def __get_pod_name(self, k8s_v2_namespace, service):
+    """Determine the pod name for the deployed service."""
+    options = self.options
+    flags = ' --namespace {namespace} --logtostderr=false'.format(
+        namespace=k8s_v2_namespace)
+    kubectl_command = 'kubectl {context} get pods {flags}'.format(
+        context=('--context {0}'.format(options.k8s_v2_account_context)
+                 if options.k8s_v2_account_context
+                 else ''),
+        flags=flags)
+
+    retcode, stdout = run_subprocess(
+        '{command}'
+        ' | gawk -F "[[:space:]]+" "/{service}/ {{print \\$1}}"'
+        ' | tail -1'.format(
+            command=kubectl_command, service=service),
         shell=True)
+    pod = stdout.strip()
+    if not pod:
+      message = 'There is no pod for "{service}" in {namespace}'.format(
+          service=service, namespace=k8s_v2_namespace)
+      raise_and_log_error(ConfigError(message, cause='NoPod'))
+
+    if retcode != 0:
+      message = 'Could not find pod for "{service}".: {error}'.format(
+          service=service,
+          error=stdout.strip())
+      raise_and_log_error(ExecutionError(message, program='kubectl'))
+    else:
+      logging.debug('pod "%s" -> %s', service, stdout)
+
+    return stdout.strip()
+
+  def do_make_port_forward_command(self, service, local_port, remote_port):
+    """Implements interface."""
+    options = self.options
+    k8s_v2_namespace = options.deploy_k8s_v2_namespace
+    service_pod = self.__get_pod_name(k8s_v2_namespace, service)
+
+    return [
+        'kubectl', '--namespace', k8s_v2_namespace,
+        'port-forward', service_pod,
+        '{local}:{remote}'.format(local=local_port, remote=remote_port)
+    ]
+
+  def do_deploy(self, script, files_to_upload):
+    """Implements the BaseBomValidateDeployer interface."""
+    # This is not yet supported in this script.
+    # To deploy spinnaker to kubernetes, you need to go through
+    # a halyard VM deployment. Halyard itself can be deployed to K8s.
+    # This script doesnt.
+    super(KubernetesV2ValidateBomDeployer, self).do_deploy(
+        script, files_to_upload)
+
+  def do_undeploy(self):
+    """Implements the BaseBomValidateDeployer interface."""
+    super(KubernetesV2ValidateBomDeployer, self).do_undeploy()
+    # kubectl delete namespace spinnaker
+
+  def do_fetch_service_log_file(self, service, log_dir):
+    """Retrieve log file for the given service's pod.
+
+    Args:
+      service: [string] The service's log to get
+      log_dir: [string] The directory name to write the logs into.
+    """
+    if service == 'monitoring':
+      # monitoring is in a sidecar of each service
+      return
+
+    options = self.options
+    k8s_v2_namespace = options.deploy_k8s_v2_namespace
+    service_pod = self.__get_pod_name(k8s_v2_namespace, service)
+
+    containers = [service]
+    if options.monitoring_install_which:
+      containers.append('monitoring-daemon')
+
+    for container in containers:
+      if container == 'monitoring-daemon':
+        path = os.path.join(log_dir, service + '_monitoring.log')
+      else:
+        path = os.path.join(log_dir, service + '.log')
+      retcode, stdout = run_subprocess(
+          'kubectl -n {namespace} -c {container} {context} logs {pod}'
+          .format(namespace=k8s_v2_namespace,
+                  container=container,
+                  context=('--context {0}'.format(options.k8s_v2_account_context)
+                           if options.k8s_v2_account_context
+                           else ''),
+                  pod=service_pod),
+          shell=True)
+      write_data_to_secure_path(stdout, path)
+
 
 class GenericVmValidateBomDeployer(BaseValidateBomDeployer):
   """Concrete deployer used to deploy Hal onto Generic VM
@@ -606,7 +790,7 @@ class GenericVmValidateBomDeployer(BaseValidateBomDeployer):
           ' -o StrictHostKeyChecking=no'
           ' -o UserKnownHostsFile=/dev/null'
           ' {user}@{ip}'
-          ' ./{script_name}'
+          ' bash -l -c ./{script_name}'
           .format(user=self.hal_user,
                   ip=self.instance_ip,
                   ssh_key=self.__ssh_key_path,
@@ -643,7 +827,7 @@ class GenericVmValidateBomDeployer(BaseValidateBomDeployer):
       self.__wait_for_ssh_helper()
     except Exception as ex:
       raise_and_log_error(
-          ExecutionError('Caught %s provisioning vm' % ex.message,
+          ExecutionError('Caught "%s" provisioning vm' % ex.message,
                          program='provisionVm'))
     finally:
       shutil.copyfile(script_path,
@@ -693,20 +877,22 @@ class GenericVmValidateBomDeployer(BaseValidateBomDeployer):
     """Implements the BaseBomValidateDeployer interface."""
     write_data_to_secure_path('', os.path.join(log_dir, service + '.log'))
     retcode, stdout = run_subprocess(
-        'scp'
+        'ssh'
         ' -i {ssh_key}'
         ' -o StrictHostKeyChecking=no'
         ' -o UserKnownHostsFile=/dev/null'
-        ' {user}@{ip}:/var/log/spinnaker/{service}/{service}.log'
-        ' {log_dir}'
+        ' {user}@{ip}'
+        ' "if [[ -f /var/log/spinnaker/{service_dir}/{service_name}.log ]];'
+        '  then cat /var/log/spinnaker/{service_dir}/{service_name}.log;'
+        '  else command -v journalctl >/dev/null && journalctl -u {service_name}; fi"'
         .format(user=self.hal_user,
                 ip=self.instance_ip,
                 ssh_key=self.ssh_key_path,
-                service=service,
-                log_dir=log_dir))
+                service_dir=service,
+                service_name=service))
     if retcode != 0:
       logging.warning('Failed obtaining %s.log: %s', service, stdout)
-      write_to_path(stdout, os.path.join(log_dir, service + '.log'))
+    write_to_path(stdout, os.path.join(log_dir, service + '.log'))
 
 
 class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
@@ -762,6 +948,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
           ConfigError('--deploy_aws_security_group not specified.'))
 
     if options.deploy_deploy:
+      logging.debug('Looking for existing EC2 instance.')
       retcode, stdout = run_subprocess(
           'aws ec2 describe-instances'
           ' --profile {region}'
@@ -773,7 +960,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
         raise_and_log_error(
             ExecutionError('Could not probe AWS: {0}'.format(stdout),
                            program='aws'))
-      reservations = json.JSONDecoder().decode(stdout).get('Reservations')
+      reservations = decode_json(stdout).get('Reservations')
       # For some reason aws is ignoring our filter, so check again just to be
       # sure the reservations returned are the ones we asked for.
       for reservation in reservations or []:
@@ -796,6 +983,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
   def do_determine_instance_ip(self):
     """Implements GenericVmValidateBomDeployer interface."""
     options = self.options
+    logging.debug('Looking up EC2 instance IP.')
     retcode, stdout = run_subprocess(
         'aws ec2 describe-instances'
         ' --profile {region}'
@@ -808,14 +996,22 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
       raise_and_log_error(
           ExecutionError('Could not determine public IP: {0}'.format(stdout),
                          program='aws'))
-    found = json.JSONDecoder().decode(stdout).get('Reservations')
+    found = decode_json(stdout).get('Reservations')
     if not found:
       raise_and_log_error(
           ResponseError(
               '"{0}" is not running'.format(options.deploy_aws_name),
               server='ec2'))
 
-    return found[0]['Instances'][0]['PublicIpAddress']
+    try:
+      ip = found[0]['Instances'][0]['PublicIpAddress']
+    except KeyError:
+      logging.error('**** aws ec2 describe instances returned %r\n'
+                    'expected [0]["Instances"][0]["PublicIpAddress"]',
+                    found)
+      raise
+    logging.debug('Using public IP=%s', ip)
+    return ip
 
   def do_create_vm(self, options):
     """Implements GenericVmValidateBomDeployer interface."""
@@ -824,6 +1020,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
     logging.info('Creating "%s" with key-pair "%s"',
                  options.deploy_aws_name, key_pair_name)
 
+    logging.debug('Creating new EC2 VM.')
     response = check_subprocess(
         'aws ec2 run-instances'
         ' --profile {region}'
@@ -838,7 +1035,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
                 type='t2.xlarge',  # 4 core x 16G
                 key_pair_name=key_pair_name,
                 sg=options.deploy_aws_security_group))
-    doc = json.JSONDecoder().decode(response)
+    doc = decode_json(response)
     self.__instance_id = doc["Instances"][0]["InstanceId"]
     logging.info('Created instance id=%s to tag as "%s"',
                  self.__instance_id, options.deploy_aws_name)
@@ -881,7 +1078,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
 
     # result is an array of reservations of ararys of instances.
     # but we only expect one, so fish out the first instance info
-    info = json.JSONDecoder().decode(stdout)[0][0]
+    info = decode_json(stdout)[0][0]
     state = info.get('State', {}).get('Name')
     if state in ['pending', 'initializing']:
       logging.info('Waiting for %s to finish initializing (state=%s)',
@@ -932,7 +1129,7 @@ class AwsValidateBomDeployer(GenericVmValidateBomDeployer):
           ',Name=instance-state-name,Values=running"'
           .format(region=options.deploy_aws_region,
                   name=options.deploy_aws_name))
-      exists = json.JSONDecoder().decode(lookup_response).get('Reservations')
+      exists = decode_json(lookup_response).get('Reservations')
       if not exists:
         logging.warning('"%s" is not running', options.deploy_aws_name)
         return
@@ -1028,8 +1225,7 @@ class AzureValidateBomDeployer(GenericVmValidateBomDeployer):
                 location=options.deploy_azure_location,
                 image=options.deploy_azure_image,
                 ssh_key_path=self.ssh_key_path))
-    self.set_instance_ip(json.JSONDecoder().decode(
-        response)['publicIpAddress'])
+    self.set_instance_ip(decode_json(response)['publicIpAddress'])
 
   def do_undeploy(self):
     """Implements the BaseBomValidateDeployer interface."""
@@ -1062,7 +1258,7 @@ class AzureValidateBomDeployer(GenericVmValidateBomDeployer):
       raise_and_log_error(
           ExecutionError('Could not determine public IP: {0}'.format(stdout),
                          program='az'))
-    found = json.JSONDecoder().decode(stdout)[0].get('virtualMachine')
+    found = decode_json(stdout)[0].get('virtualMachine')
     if not found:
       raise_and_log_error(
           ResponseError(
@@ -1084,6 +1280,8 @@ class GoogleValidateBomDeployer(GenericVmValidateBomDeployer):
 
     # Note: this used to dup_stderr_to_stdout=False with an older API
     # presumably this wont return stderr anymore or it will corrupt the json.
+    logging.debug('Looking up IP address for "%s"...',
+                  options.deploy_google_instance)
     response = check_subprocess(
         'gcloud compute instances describe'
         ' --format json'
@@ -1093,12 +1291,16 @@ class GoogleValidateBomDeployer(GenericVmValidateBomDeployer):
                 project=options.deploy_google_project,
                 zone=options.deploy_google_zone,
                 instance=options.deploy_google_instance))
-    nic = json.JSONDecoder().decode(response)['networkInterfaces'][0]
+    nic = decode_json(response)['networkInterfaces'][0]
 
     use_internal_ip = options.deploy_google_use_internal_ip
     if use_internal_ip:
+      logging.debug('Using internal IP=%s', nic['networkIP'])
       return nic['networkIP']
-    return nic['accessConfigs'][0]['natIP']
+
+    ip = nic['accessConfigs'][0]['natIP']
+    logging.debug('Using natIP=%s', ip)
+    return ip
 
   def __init__(self, options, metrics, **kwargs):
     super(GoogleValidateBomDeployer, self).__init__(options, metrics, **kwargs)
@@ -1168,6 +1370,8 @@ class GoogleValidateBomDeployer(GenericVmValidateBomDeployer):
           ConfigError('--deploy_hal_google_service_account not specified.'))
 
     if options.deploy_deploy:
+      logging.debug('Checking if "%s" already exists...',
+                    options.deploy_google_instance)
       retcode, _ = run_subprocess(
           'gcloud compute instances describe'
           ' --account {gcloud_account}'
@@ -1217,7 +1421,8 @@ class GoogleValidateBomDeployer(GenericVmValidateBomDeployer):
                 network=options.deploy_google_network,
                 network_tags=options.deploy_google_tags,
                 ssh_key=ssh_key,
-                instance=options.deploy_google_instance))
+                instance=options.deploy_google_instance),
+      stream=sys.stdout)
 
   def do_undeploy(self):
     """Implements the BaseBomValidateDeployer interface."""
@@ -1274,6 +1479,8 @@ def make_deployer(options, metrics):
           'A "distributed" deployment requires --deploy_distributed_platform'))
     if options.deploy_distributed_platform == 'kubernetes':
       spin_klass = KubernetesValidateBomDeployer
+    elif options.deploy_distributed_platform == 'kubernetes_v2':
+      spin_klass = KubernetesV2ValidateBomDeployer
     else:
       raise_and_log_error(ConfigError(
           'Unknown --deploy_distributed_platform.'
@@ -1385,3 +1592,4 @@ def init_argument_parser(parser, defaults):
   AzureValidateBomDeployer.init_platform_argument_parser(parser, defaults)
   GoogleValidateBomDeployer.init_platform_argument_parser(parser, defaults)
   KubernetesValidateBomDeployer.init_platform_argument_parser(parser, defaults)
+  KubernetesV2ValidateBomDeployer.init_platform_argument_parser(parser, defaults)

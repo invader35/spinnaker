@@ -21,6 +21,7 @@
 bintray_jar_repository: jars
 bintray_org: spinnaker-releases
 bintray_debian_repository: debians
+bintray_publish_wait_secs: -1
 
 
 ################################
@@ -33,8 +34,14 @@ halyard_bom_bucket: halconfig
 
 
 ################################
+# Spin CLI Commands
+################################
+spin_build_bucket: spinnaker-artifacts
+spin_build_credentials_path:
+
+
+################################
 # Container Commands
 ################################
 docker_registry: gcr.io/spinnaker-marketplace
 gcb_project: spinnaker-marketplace
-

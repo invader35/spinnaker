@@ -26,6 +26,7 @@ set -e
 # Import support functions
 source $(dirname $0)/support_functions.sh
 
+HAL_BRANCH=master
 
 ########################################################
 # Build all the release artifacts (wait for completion)
@@ -48,10 +49,13 @@ function run_build_flow() {
       "--max_local_builds=6"
 
   start_command_unless NO_HALYARD "build_halyard" \
-      $EXTRA_BUILD_HALYARD_ARGS
+      $EXTRA_BUILD_HALYARD_ARGS --git_branch $HAL_BRANCH
+
+  start_command_unless NO_SPIN "build_spin" \
+      $EXTRA_BOM_COMMAND_ARGS
 
   start_command_unless NO_CHANGELOG "build_changelog" \
-      $EXTRA_BOM_COMMAND_ARGS \
+      $EXTRA_BOM_COMMAND_ARGS
 
   # Synchronize here so we have all the artifacts build before we continue.
   wait_for_commands_or_die "Build"
@@ -115,6 +119,9 @@ function process_args() {
         --no_halyard)
           NO_HALYARD=true
           ;;
+        --no_spin)
+          NO_SPIN=true
+          ;;
         --no_changelog)
           NO_CHANGELOG=true
           ;;
@@ -141,8 +148,7 @@ function process_args() {
           shift
           ;;
         --hal_branch)
-          local branch=$1
-          EXTRA_BUILD_HALYARD="$EXTRA_BUILD_HALYARD_ARGS --git_branch $1"
+          HAL_BRANCH=$1
           shift
           ;;
         --parent_invocation_id)

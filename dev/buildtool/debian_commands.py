@@ -27,6 +27,9 @@ from buildtool import (
     ConfigError)
 
 
+NON_DEBIAN_BOM_REPOSITORIES = ['spin']
+
+
 class BuildDebianCommand(GradleCommandProcessor):
   def __init__(self, factory, options, **kwargs):
     options.github_disable_upstream_push = True
@@ -39,9 +42,12 @@ class BuildDebianCommand(GradleCommandProcessor):
       raise_and_log_error(ConfigError('Expected BINTRAY_USER set.'))
     check_options_set(
         options, ['bintray_org', 'bintray_jar_repository',
-                  'bintray_debian_repository'])
+                  'bintray_debian_repository', 'bintray_publish_wait_secs'])
 
   def _do_can_skip_repository(self, repository):
+    if repository.name in NON_DEBIAN_BOM_REPOSITORIES:
+      return True
+
     build_version = self.scm.get_repository_service_build_version(repository)
     return self.gradle.consider_debian_on_bintray(repository, build_version)
 
@@ -57,11 +63,10 @@ class BuildDebianCommand(GradleCommandProcessor):
         or (name == 'deck' and not 'CHROME_BIN' in os.environ)):
       args.append('-x test')
 
-    if not options.run_unit_tests and name == 'orca':
-      args.append('-x junitPlatformTest')
-      # This second one is only for 1.5.x
-      # args.append('-x generateHtmlTestReports')
-    args.extend(self.gradle.get_debian_args('trusty,xenial'))
+    if (os.path.isfile(os.path.join(repository.git_dir, "gradle", "init-publish.gradle"))):
+      args.append('-I gradle/init-publish.gradle')
+
+    args.extend(self.gradle.get_debian_args('trusty,xenial,bionic'))
 
     with self.__semaphore:
       self.gradle.check_run(args, self, repository, 'candidate', 'debian-build')

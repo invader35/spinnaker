@@ -207,7 +207,12 @@ class BuildHalyardCommand(GradleCommandProcessor):
     if not self.options.run_unit_tests:
       args.append('-x test')
 
-    args.extend(self.gradle.get_debian_args('trusty-nightly,xenial-nightly'))
+    if (os.path.isfile(os.path.join(repository.git_dir,
+                                    "gradle", "init-publish.gradle"))):
+      args.append('-I gradle/init-publish.gradle')
+
+    args.extend(self.gradle.get_debian_args(
+        'trusty-nightly,xenial-nightly,bionic-nightly'))
     build_number = source_info.build_number
     version = source_info.summary.version
     self.gradle.check_run(args, self, repository, 'candidate', 'debian-build',
@@ -345,12 +350,8 @@ class PublishHalyardCommand(CommandProcessor):
     self.__release_tag = 'version-' + semver_str
     self.__release_version = semver_str
 
-  def determine_commit(self, repository):
+  def determine_halyard_commit(self):
     """Determine the commit_id that we want to publish."""
-    if repository.name != 'halyard':
-      raise_and_log_error(
-          ConfigError('Unexpected repository "%s"' % repository.name))
-
     options = self.options
     versions_url = options.halyard_version_commits_url
     if not versions_url:
@@ -367,11 +368,12 @@ class PublishHalyardCommand(CommandProcessor):
       version_data = check_subprocess(
           'gsutil cat {url}'.format(url=versions_url))
 
-    commit = yaml.load(version_data).get(options.halyard_version)
+    commit = yaml.safe_load(version_data).get(options.halyard_version)
     if commit is None:
       raise_and_log_error(
           ConfigError('Unknown halyard version "{version}" in "{url}"'.format(
               version=options.halyard_version, url=versions_url)))
+    return commit
 
   def _prepare_repository(self):
     """Prepare a local repository to build for release.
@@ -381,9 +383,9 @@ class PublishHalyardCommand(CommandProcessor):
     into github so want to at least clone the repo regardless.
     """
     logging.debug('Preparing repository for publishing a halyard release.')
+    commit = self.determine_halyard_commit()
     repository = self.__scm.make_repository_spec(
-        SPINNAKER_HALYARD_REPOSITORY_NAME)
-    commit = self.determine_commit(repository)
+        SPINNAKER_HALYARD_REPOSITORY_NAME, commit_id=commit)
     git_dir = repository.git_dir
     if os.path.exists(git_dir):
       logging.info('Deleting existing %s to build fresh.', git_dir)
@@ -425,7 +427,7 @@ class PublishHalyardCommand(CommandProcessor):
     [*] Safety because the candidate was tested whereas this build was not.
     """
     # Ideally we would just modify the existing bintray version to add
-    # trusty-stable to the distributions, however it does not appear possible
+    # *-stable to the distributions, however it does not appear possible
     # to patch the debian attributes of a bintray version, only the
     # version metadata. Therefore, we'll rebuild it.
     # Alternatively we could download the existing and push a new one,
@@ -436,7 +438,12 @@ class PublishHalyardCommand(CommandProcessor):
     summary = self.__scm.git.collect_repository_summary(git_dir)
 
     args = self.__gradle.get_common_args()
-    args.extend(self.__gradle.get_debian_args('trusty-stable,xenial-stable'))
+    if (os.path.isfile(os.path.join(repository.git_dir,
+                                    "gradle", "init-publish.gradle"))):
+      args.append('-I gradle/init-publish.gradle')
+
+    args.extend(self.__gradle.get_debian_args(
+        'trusty-stable,xenial-stable,bionic-stable'))
     build_number = self.options.build_number
     self.__gradle.check_run(
         args, self, repository, 'candidate', 'build-release',
@@ -527,7 +534,7 @@ class PublishHalyardCommand(CommandProcessor):
     git_dir = repository.git_dir
     git = self.__scm.git
 
-    release_url = repository.origin
+    release_url = git.determine_push_url(repository)
     logging.info('Pushing branch=%s and tag=%s to %s',
                  self.__release_branch, self.__release_tag, release_url)
 

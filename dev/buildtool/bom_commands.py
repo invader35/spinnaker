@@ -64,14 +64,14 @@ class BomBuilder(object):
   """Helper class for BuildBomCommand that constructs the bom specification."""
 
   @staticmethod
-  def new_from_bom(options, scm, bom):
-    return BomBuilder(options, scm, base_bom=bom)
+  def new_from_bom(options, scm, metrics, bom):
+    return BomBuilder(options, scm, metrics, base_bom=bom)
 
   @property
   def base_bom(self):
     return self.__base_bom
 
-  def __init__(self, options, scm, base_bom=None):
+  def __init__(self, options, scm, metrics, base_bom=None):
     """Construct new builder.
 
     Args:
@@ -81,6 +81,7 @@ class BomBuilder(object):
     """
     self.__options = options
     self.__scm = scm
+    self.__metrics = metrics
     self.__services = {}
     self.__repositories = {}
     self.__base_bom = base_bom or {}
@@ -139,7 +140,7 @@ class BomBuilder(object):
       logging.debug('Loading bom dependencies from %s',
                     self.__bom_dependencies_path)
       with open(self.__bom_dependencies_path, 'r') as stream:
-        dependencies = yaml.load(stream.read())
+        dependencies = yaml.safe_load(stream.read())
         logging.debug('Loaded %s', dependencies)
     else:
       dependencies = None
@@ -182,11 +183,29 @@ class BomBuilder(object):
 
     services = dict(self.__base_bom.get('services', {}))
     changed = False
+    def to_semver(build_version):
+      index = build_version.find('-')
+      return build_version[:index] if index >= 0 else build_version
+
     for name, info in self.__services.items():
+      labels = {'repostiory': name, 'branch': options.git_branch, 'updated': True}
       if info['commit'] == services.get(name, {}).get('commit', None):
-        logging.debug('%s commit hasnt changed -- keeping existing %s',
-                      name, info)
-        continue
+        if to_semver(info['version']) == to_semver(services.get(name, {}).get('version', '')):
+          logging.debug('%s commit hasnt changed -- keeping existing %s',
+                        name, info)
+          labels['updated'] = False
+          labels['reason'] = 'same commit'
+          self.__metrics.inc_counter('UpdateBomEntry', labels)
+          continue
+        else:
+          # An earlier branch was patched since our base bom.
+          labels['reason'] = 'different version'
+          logging.debug('%s version changed to %s even though commit has not',
+                        name, info)
+      else:
+        labels['reason'] = 'different commit'
+      self.__metrics.inc_counter('UpdateBomEntry', labels)
+
       changed = True
       services[name] = info
 
@@ -224,7 +243,7 @@ class BuildBomCommand(RepositoryCommandProcessor):
       check_path_exists(options.refresh_from_bom_path,
                         "refresh_from_bom_path")
       with open(options.refresh_from_bom_path, 'r') as stream:
-        base_bom = yaml.load(stream.read())
+        base_bom = yaml.safe_load(stream.read())
     elif options.refresh_from_bom_version:
       logging.debug('Using base bom version "%s"',
                     options.refresh_from_bom_version)
@@ -235,31 +254,7 @@ class BuildBomCommand(RepositoryCommandProcessor):
     if base_bom:
       logging.info('Creating new bom based on version "%s"',
                    base_bom.get('version', 'UNKNOWN'))
-    self.__builder = BomBuilder(self.options, self.scm, base_bom=base_bom)
-
-  def _do_can_skip_repository(self, repository):
-    name = repository.name
-    service_name = self.scm.repository_name_to_service_name(name)
-    origin = repository.origin
-    branch = self.options.git_branch
-    services = self.__builder.base_bom.get('services', {})
-    existing_bom_entry = services.get(service_name, {})
-    existing_commit = existing_bom_entry.get('commit')
-    logging.debug('Fetching current commit for %s %s', origin, branch)
-    current_commit = self.git.query_remote_repository_commit_id(origin, branch)
-
-    if current_commit == existing_commit:
-      result = True
-      reason = 'same commit'
-      logging.debug('%s %s is unchanged - skip.', origin, branch)
-    else:
-      result = False
-      reason = 'different commit' if existing_bom_entry else 'fresh bom'
-
-    labels = {'repository': name, 'branch': branch,
-              'reason': reason, 'updated': result}
-    self.metrics.inc_counter('UpdateBomEntry', labels)
-    return result
+    self.__builder = BomBuilder(self.options, self.scm, self.metrics, base_bom=base_bom)
 
   def _do_repository(self, repository):
     source_info = self.scm.refresh_source_info(
@@ -273,7 +268,7 @@ class BuildBomCommand(RepositoryCommandProcessor):
       logging.info('Bom has not changed from version %s @ %s',
                    bom['version'], bom['timestamp'])
 
-    bom_text = yaml.dump(bom, default_flow_style=False)
+    bom_text = yaml.safe_dump(bom, default_flow_style=False)
 
     path = _determine_bom_path(self)
     write_to_path(bom_text, path)
@@ -361,12 +356,12 @@ class PublishBomCommand(RepositoryCommandProcessor):
       logging.info('Publishing bom alias %s = %s',
                    alias, os.path.basename(bom_path))
       with open(bom_path, 'r') as stream:
-        bom = yaml.load(stream)
+        bom = yaml.safe_load(stream)
 
       alias_path = os.path.join(os.path.dirname(bom_path), alias + '.yml')
       with open(alias_path, 'w') as stream:
         bom['version'] = options.bom_alias
-        yaml.dump(bom, stream, default_flow_style=False)
+        yaml.safe_dump(bom, stream, default_flow_style=False)
       self.__hal_runner.publish_bom_path(alias_path)
 
   def __publish_configs(self, bom_path):
@@ -392,7 +387,7 @@ class PublishBomCommand(RepositoryCommandProcessor):
     """Gets the component config files and writes them into the output_dir."""
     name = repository.name
     if (name not in SPINNAKER_BOM_REPOSITORY_NAMES
-        or name in ['spinnaker']):
+        or name in ['spin']):
       logging.debug('%s does not use config files -- skipping', name)
       return
 

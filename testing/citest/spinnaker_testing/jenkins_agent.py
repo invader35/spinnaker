@@ -84,6 +84,21 @@ class JenkinsOperationStatus(base_agent.AgentOperationStatus):
   def __str__(self):
     return 'jenkins_trigger_status={0}'.format(self.__trigger_status)
 
+  def export_summary_to_json_snapshot(self, snapshot, entity):
+    """Implements JsonSnapshotableEntity interface."""
+    super(JenkinsOperationStatus, self).export_summary_to_json_snapshot(
+        snapshot, entity)
+    trigger_status = self.__trigger_status
+    trigger_status_summary = snapshot.make_entity_for_object_summary(
+        self.__trigger_status)
+    detail_doc = trigger_status.detail_doc
+    status_status = detail_doc[0].get('status') if detail_doc else None
+    relation = ('VALID' if status_status == 'SUCCEEDED'
+                else 'INVALID' if status_status == 'TERMINAL'
+                else None)
+    snapshot.edge_builder.make(
+        entity, 'Trigger Status', trigger_status_summary, relation=relation)
+
   def export_to_json_snapshot(self, snapshot, entity):
     snapshot.edge_builder.make_output(
         entity, 'Trigger Status', self.__trigger_status)
@@ -93,15 +108,16 @@ class JenkinsOperationStatus(base_agent.AgentOperationStatus):
 
 class JenkinsAgent(base_agent.BaseAgent):
   """A specialization of BaseAgent for interacting with Jenkins."""
-  def __init__(self, baseUrl, auth_path, owner_agent, logger=None):
+  def __init__(self, baseUrl, auth_path, owner_agent, logger=None, max_wait_secs=780):
     super(JenkinsAgent, self).__init__(logger=logger)
     self.__http_agent = http_agent.HttpAgent(baseUrl)
     self.__owner_agent = owner_agent
 
-    # Allow up to 13 minutes to wait on operations.
-    # 13 minutes is arbitrary. The current test takes around 6-7 minutes
-    # end-to-end. Other use cases might make it more clear what this should be.
-    self.default_max_wait_secs = 780
+    # Set the timeout for waiting on operations.  The default of 13 minutes
+    # (set in the parameter list above) is arbitrary; the current test takes
+    # around 6-7 minutes end-to-end. Other use cases might make it more clear
+    # what this should be.
+    self.default_max_wait_secs = max_wait_secs
 
     # pylint: disable=bad-indentation
     if auth_path is None:
@@ -113,7 +129,7 @@ class JenkinsAgent(base_agent.BaseAgent):
               ' or JENKINS_USER and JENKINS_PASSWORD environment variables.')
     else:
         with open(auth_path, 'r') as f:
-          auth_info = f.read().split()
+          auth_info = bytes.decode(f.read()).split()
 
           if len(auth_info) != 2:
             raise ValueError(
@@ -141,7 +157,7 @@ class JenkinsAgent(base_agent.BaseAgent):
     super(JenkinsAgent, self).export_to_json_snapshot(snapshot, entity)
 
   def new_jenkins_trigger_operation(self, title, job, token, status_class,
-                                    status_path):
+                                    status_path, **kwargs):
     """Returns a new JenkinsTriggerOperation
 
     Args:
@@ -151,12 +167,13 @@ class JenkinsAgent(base_agent.BaseAgent):
       status_class [AgentOperationStatus]: The status object in charge of
         recording the success of the action resulting from the trigger.
       status_path [string]: The path the status_class must poll on for
-        success of the trigger
+        success of the trigger.
+      kwargs [kwargs]:  Additional AgentOperation kwargs.
     """
     return JenkinsTriggerOperation(
         title=title, jenkins_agent=self,
         status_class=status_class, job=job, token=token,
-        status_path=status_path)
+        status_path=status_path, **kwargs)
 
 
 class BaseJenkinsOperation(base_agent.AgentOperation):
@@ -169,7 +186,7 @@ class BaseJenkinsOperation(base_agent.AgentOperation):
     return self.__data
 
   def __init__(self, title, jenkins_agent,
-               status_class=JenkinsOperationStatus, max_wait_secs=None):
+               status_class=JenkinsOperationStatus, **kwargs):
     """Construct a BaseJenkinsOperation
 
     Args:
@@ -178,9 +195,9 @@ class BaseJenkinsOperation(base_agent.AgentOperation):
         configuration stored.
       status_class [AgentOperationStatus]: The status class that will
        confirm success of the action resulting from the Jenkins trigger.
+      kwargs [kwargs]:  Additional AgentOperation constructor kwargs.
     """
-    super(BaseJenkinsOperation, self).__init__(title, jenkins_agent,
-                                               max_wait_secs=max_wait_secs)
+    super(BaseJenkinsOperation, self).__init__(title, jenkins_agent, **kwargs)
     if not jenkins_agent or not isinstance(jenkins_agent, JenkinsAgent):
       raise TypeError('agent not a  JenkinsAgent: '
                       + jenkins_agent.__class__.__name__)
@@ -215,7 +232,7 @@ class JenkinsTriggerOperation(BaseJenkinsOperation):
   project.
   """
   def __init__(self, title, jenkins_agent, token, job, status_class,
-               status_path):
+               status_path, **kwargs):
     """Construct a JenkinsTriggerOperation.
 
     Args:
@@ -227,9 +244,11 @@ class JenkinsTriggerOperation(BaseJenkinsOperation):
       status_class [AgentOperationClass]: The status class used to monitor the
           action that the jenkins trigger kicked off.
       status_path [string]: The path the status should poll for success on.
+      kwargs [kwargs]:  Additional Operation constructor kwargs.
     """
     super(JenkinsTriggerOperation, self).__init__(
-        jenkins_agent=jenkins_agent, status_class=status_class, title=title)
+        jenkins_agent=jenkins_agent, status_class=status_class, title=title,
+        **kwargs)
 
     self.__token = token
     self.__job = job

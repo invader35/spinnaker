@@ -22,7 +22,13 @@ import os
 import re
 import shutil
 import textwrap
-import urllib2
+import yaml
+
+try:
+  from urllib2 import urlopen, HTTPError
+except ImportError:
+  from urllib.request import urlopen
+  from urllib.error import HTTPError
 
 
 from buildtool import (
@@ -40,6 +46,7 @@ from buildtool import (
     UnexpectedError,
     CommitMessage,
     GitRunner,
+    HalRunner,
 
     check_kwargs_empty,
     check_options_set,
@@ -135,7 +142,7 @@ class ChangelogRepositoryData(
     def get_thing_list(title_line):
       """Return bucket for title_line, adding new one if needed."""
       match = TITLE_LINE_MATCHER.match(title_line)
-      thing = match.group(1) if match else None
+      thing = match.group(1) if match else ''
       if not thing in thing_dict:
         thing_dict[thing] = []
       return thing_dict[thing]
@@ -242,15 +249,15 @@ class ChangelogBuilder(object):
         clean_text = self.clean_message(first_line)
         match = one_liner.match(clean_text)
         if match:
-          text = '**{thing}:**  {message}'.format(
+          text = u'**{thing}:**  {message}'.format(
               thing=match.group(1), message=match.group(2))
         else:
           text = clean_text
 
-        link = '[{short_hash}]({base_url}/commit/{full_hash})'.format(
+        link = u'[{short_hash}]({base_url}/commit/{full_hash})'.format(
             short_hash=msg.commit_id[:8], full_hash=msg.commit_id,
             base_url=base_url)
-        report.append('* {text} ({link})'.format(text=text, link=link))
+        report.append(u'* {text} ({link})'.format(text=text, link=link))
       report.append('')
     return report
 
@@ -271,11 +278,11 @@ class ChangelogBuilder(object):
     base_url = entry.repository.origin
     for msg in entry.normalized_messages:
       clean_text = self.clean_message(msg.message)
-      link = '[{short_hash}]({base_url}/commit/{full_hash})'.format(
+      link = u'[{short_hash}]({base_url}/commit/{full_hash})'.format(
           short_hash=msg.commit_id[:8], full_hash=msg.commit_id,
           base_url=base_url)
       level = msg.determine_semver_implication()
-      report.append('**{level}** ({link})\n{detail}\n'.format(
+      report.append(u'**{level}** ({link})\n{detail}\n'.format(
           level=level_name[level], link=link, detail=clean_text))
     return report
 
@@ -286,13 +293,34 @@ class BuildChangelogCommand(RepositoryCommandProcessor):
   def __init__(self, factory, options, **kwargs):
     # Use own repository to avoid race conditions when commands are
     # running concurrently.
+    if options.relative_to_bom_path and options.relative_to_bom_version:
+      raise_and_log_error(
+          ConfigError(
+              'Cannot specify both --relative_to_bom_path'
+              ' and --relative_to_bom_version.'))
+
     options_copy = copy.copy(options)
     options_copy.github_disable_upstream_push = True
+
+    if options.relative_to_bom_path:
+      with open(options.relative_to_bom_path, 'r') as stream:
+        self.__relative_bom = yaml.safe_load(stream.read())
+    elif options.relative_to_bom_version:
+      self.__relative_bom = HalRunner(options).retrieve_bom_version(
+          options.relative_to_bom_version)
+    else:
+      self.__relative_bom = None
     super(BuildChangelogCommand, self).__init__(factory, options_copy, **kwargs)
 
   def _do_repository(self, repository):
     """Collect the summary for the given repository."""
-    return self.git.collect_repository_summary(repository.git_dir)
+    if self.__relative_bom:
+      repo_name = self.scm.repository_name_to_service_name(repository.name)
+      bom_commit = self.__relative_bom['services'][repo_name]['commit']
+    else:
+      bom_commit = None
+    return self.git.collect_repository_summary(repository.git_dir,
+                                               base_commit_id=bom_commit)
 
   def _do_postprocess(self, result_dict):
     """Construct changelog from the collected summary, then write it out."""
@@ -321,11 +349,24 @@ class BuildChangelogFactory(RepositoryCommandFactory):
     """Adds command-specific arguments."""
     super(BuildChangelogFactory, self).init_argparser(
         parser, defaults)
+
     self.add_argument(
         parser, 'include_changelog_details', defaults, False,
         action='store_true',
         help='Include a "details" section with the full commit messages'
              ' in time sequence in the changelog.')
+
+    HalRunner.add_parser_args(parser, defaults)
+    self.add_argument(
+        parser, 'relative_to_bom_path', defaults, None,
+        help='If specified then produce the changelog relative to the'
+             ' commits found in the specified bom rather than the previous'
+             ' repository tag.')
+    self.add_argument(
+        parser, 'relative_to_bom_version', defaults, None,
+        help='If specified then produce the changelog relative to the'
+             ' commits found in the specified bom rather than the previous'
+             ' repository tag.')
 
 
 class PublishChangelogFactory(RepositoryCommandFactory):
@@ -361,11 +402,11 @@ class PublishChangelogCommand(RepositoryCommandProcessor):
     try:
       logging.debug('Verifying changelog gist exists at "%s"',
                     options.changelog_gist_url)
-      urllib2.urlopen(options.changelog_gist_url)
-    except urllib2.HTTPError as error:
+      urlopen(options.changelog_gist_url)
+    except HTTPError as error:
       raise_and_log_error(
           ConfigError(
-              'Changelog gist "{url}": {error}'.format(
+              u'Changelog gist "{url}": {error}'.format(
                   url=options.changelog_gist_url,
                   error=error.message)))
 
@@ -424,11 +465,12 @@ class PublishChangelogCommand(RepositoryCommandProcessor):
       header = textwrap.dedent(
           """\
           ---
-          title: Version {version}
+          title: Version {major}.{minor}
+          changelog_title: Version {version}
           date: {timestamp}
           tags: changelogs {major}.{minor}
+          version: {version}
           ---
-          # Spinnaker {version}
           """.format(
               version=version,
               timestamp=timestamp,

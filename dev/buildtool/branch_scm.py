@@ -67,11 +67,12 @@ class BranchSourceCodeManager(SpinnakerSourceCodeManager):
     options = self.options
     if github_owner in ('upstream', 'default'):
       github_owner = 'spinnaker'
-    origin_hostname = options.github_hostname
 
-    if self.options.github_filesystem_root:
-      return os.path.join(self.options.github_filesystem_root,
-                          origin_hostname, github_owner, name)
+    if self.options.github_repository_root:
+      return '/'.join([self.options.github_repository_root,
+                       github_owner, name])
+
+    origin_hostname = options.github_hostname
     if self.options.github_pull_ssh:
       return self.git.make_ssh_url(origin_hostname, github_owner, name)
     return self.git.make_https_url(origin_hostname, github_owner, name)
@@ -108,11 +109,22 @@ class BranchSourceCodeManager(SpinnakerSourceCodeManager):
     return build_number
 
   def check_repository_is_current(self, repository):
-    branch = self.options.git_branch or 'master'
     git_dir = repository.git_dir
+    commit = repository.commit_or_none()
+    if commit is not None:
+      have_commit = self.git.query_local_repository_commit_id(git_dir)
+      if have_commit != commit:
+        raise_and_log_error(
+          UnexpectedError(
+             '"%s" is at the wrong commit "%s" vs "%s"' % (
+                 git_dir, have_commit, commit)))
+      return True
+
+    branch = self.options.git_branch or 'master'
     have_branch = self.git.query_local_repository_branch(git_dir)
     if have_branch != branch:
       raise_and_log_error(
           UnexpectedError(
-              '"%s" is at the wrong branch "%s"' % (git_dir, branch)))
+              '"%s" is at the wrong branch "%s" vs "%s"' % (
+                  git_dir, have_branch, branch)))
     return True

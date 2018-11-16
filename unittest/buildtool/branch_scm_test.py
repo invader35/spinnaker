@@ -27,6 +27,7 @@ from buildtool import (
     SemanticVersion,
     BranchSourceCodeManager,
     SpinnakerSourceCodeManager,
+    UnexpectedError,
 
     check_subprocess_sequence)
 
@@ -101,7 +102,7 @@ class TestSourceCodeManager(unittest.TestCase):
           'touch "{file}"'.format(file=untagged_file),
           run_git('add "{file}"'.format(
               file=os.path.basename(untagged_file))),
-          run_git('commit -a -m "chore(uniq): untagged commit"'),
+          run_git('commit -a -m "feat(uniq): untagged commit"'),
           run_git('checkout master')
           ])
 
@@ -120,7 +121,7 @@ class TestSourceCodeManager(unittest.TestCase):
     for repo_name in tests:
       repository = scm.make_repository_spec(repo_name)
       expect = os.path.join(test_root, repo_name)
-      self.assertEquals(expect, repository.git_dir)
+      self.assertEqual(expect, repository.git_dir)
       self.assertFalse(os.path.exists(expect))
 
   def test_maybe_pull_repository_branch(self):
@@ -137,17 +138,17 @@ class TestSourceCodeManager(unittest.TestCase):
 
       git_dir = repository.git_dir
       spec = scm.git.determine_git_repository_spec(git_dir)
-      self.assertEquals(repository, spec)
+      self.assertEqual(repository, spec)
 
       in_branch = scm.git.query_local_repository_branch(git_dir)
-      self.assertEquals(UNTAGGED_BRANCH, in_branch)
+      self.assertEqual(UNTAGGED_BRANCH, in_branch)
 
       summary = scm.git.collect_repository_summary(git_dir)
       semver = SemanticVersion.make(BASE_VERSION)
       expect_version = semver.next(
           SemanticVersion.MINOR_INDEX).to_version()
 
-      self.assertEquals(expect_version, summary.version)
+      self.assertEqual(expect_version, summary.version)
 
   def test_pull_repository_fallback_branch(self):
     test_root = os.path.join(self.base_temp_dir, 'fallback_test')
@@ -166,7 +167,7 @@ class TestSourceCodeManager(unittest.TestCase):
                      if repository.name == 'RepoTwo'
                      else 'master')
       in_branch = scm.git.query_local_repository_branch(git_dir)
-      self.assertEquals(want_branch, in_branch)
+      self.assertEqual(want_branch, in_branch)
 
   def test_foreach_repo(self):
     test_root = os.path.join(self.base_temp_dir, 'foreach_test')
@@ -185,8 +186,55 @@ class TestSourceCodeManager(unittest.TestCase):
       return (repository, list(pos_args), dict(kwargs))
     got = scm.foreach_source_repository(
         all_repos, _foreach_func, *pos_args, **kwargs)
-    self.assertEquals(expect, got)
+    self.assertEqual(expect, got)
 
+  def test_check_repository_branch(self):
+    self.options.git_branch = UNTAGGED_BRANCH
+    
+    test_root = os.path.join(self.base_temp_dir, 'check_branch_test')
+    scm = BranchSourceCodeManager(self.options, test_root)
+    repository_name = 'RepoOne'
+    origin = self.ORIGIN_URLS[repository_name]
+    repository = scm.make_repository_spec(repository_name, origin=origin,
+                                          upstream=None)
+    scm.ensure_local_repository(repository)
+    scm.check_repository_is_current(repository)
+
+    scm.git.check_run(repository.git_dir, 'checkout master')
+    self.assertRaises(UnexpectedError, scm.check_repository_is_current, repository)
+    
+  def test_check_repository_commit(self):
+    self.options.git_branch = UNTAGGED_BRANCH
+    
+    test_root = os.path.join(self.base_temp_dir, 'check_commit_test')
+    scm = BranchSourceCodeManager(self.options, test_root)
+    repository_name = 'RepoOne'
+    origin = self.ORIGIN_URLS[repository_name]
+    repository = scm.make_repository_spec(repository_name, origin=origin,
+                                          upstream=None)
+    scm.ensure_local_repository(repository)
+    scm.check_repository_is_current(repository)
+
+    # Create another repo pinned to this particular commit.
+    commit = scm.git.query_local_repository_commit_id(repository.git_dir)
+    repository_at_commit = scm.make_repository_spec(
+        repository_name, origin=origin, upstream=None, commit_id=commit)
+
+    # We're at the commit, so this should validate.
+    scm.check_repository_is_current(repository_at_commit)
+
+    # Make a change to the repo so commit differs.
+    with open(os.path.join(repository.git_dir, 'scrap'), 'w') as stream:
+      stream.write('hello');
+    scm.git.check_run(repository.git_dir, 'add scrap')
+    scm.git.check_run(repository.git_dir, 'commit -a -m "added file"')
+
+    # We're still in the branch, so the branch only repository is still ok,
+    # but no longer at the same commit, so the commit-pinned repository is bad.
+    scm.check_repository_is_current(repository)
+    self.assertRaises(UnexpectedError, scm.check_repository_is_current,
+                      repository_at_commit)
+    
 
 if __name__ == '__main__':
   init_runtime()

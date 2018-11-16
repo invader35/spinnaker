@@ -62,7 +62,7 @@ import re
 import sys
 import tarfile
 from json import JSONDecoder
-from StringIO import StringIO
+from io import BytesIO
 
 import citest.gcp_testing.gce_util as gce_util
 import citest.service_testing as service_testing
@@ -167,8 +167,9 @@ class SpinnakerStatus(service_testing.HttpOperationStatus):
           indicate an error making the original request.
     """
     super(SpinnakerStatus, self).__init__(operation, original_response)
-    # The request ID is typically the response payload.
-    self.__request_id = original_response.output
+    if original_response is not None:
+      # The request ID is typically the response payload.
+      self.__request_id = original_response.output
     self.__current_state = None  # Last known state (after last refresh()).
     self.__detail_path = None    # The URL path on spinnaker for this status.
     self.__exception_details = None
@@ -228,6 +229,88 @@ class SpinnakerStatus(service_testing.HttpOperationStatus):
     """
     # pylint: disable=unused-argument
     raise Exception("_update_response_from_json is not specialized.")
+
+
+  # helper for producing snapshot json
+  # maps relation to priority when determining outermost from list
+  # We treat None (not started) higher than valid.
+  _RELATION_SCORE = {
+      'VALID': 1,
+      None: 2,
+      'INVALID': 3,
+      'ERROR': 4,
+  }
+  # Inversion of _RELATION_SCORE
+  _SCORE_TO_RELATION = {value: key for key, value in _RELATION_SCORE.items()}
+
+  # Convert standard spinnaker status to citest journal relation qualifier
+  # names.
+  _STATUS_TO_RELATION = {
+      'SUCCEEDED': 'VALID',
+      'TERMINAL': 'INVALID',
+      'NOT_STARTED': None,
+  }
+
+  def _export_status(self, info, builder, entity):
+    """Helper function for writing spinnaker status into SnapshotableEntity.
+
+    Args:
+      info [dict]: The spinnaker Status schema with a 'status' attribute.
+        Has no effect if there is no "status" attribute.
+
+    Returns:
+      The spinnaker status attribute value.
+    """
+    status = info.get('status')
+    if not status:
+      return None
+    builder.make(entity, 'Status', status,
+                 relation=self._STATUS_TO_RELATION.get(status))
+    return status
+
+  def _export_time_info(self, info, base_time, builder, entity):
+    """Helper function to write Status entry timing info to SnapshotableEntity.
+
+    This writes a timestamp offset and delta where the offset is relative to
+    an absolute base_time. The delta are the being/end time in the info.
+
+    Args:
+      info [dict]: The spinnaker Status schema with start/endTime attributes.
+        There start/endTime attributes are optional.
+      base_time [int]: The base timestamp (in ms) for timestamp offset.
+    """
+    start_time = info.get('startTime')
+    if start_time is None:
+      return
+    offset = (start_time - base_time) / 1000.0
+    end_time = info.get('endTime')
+    if not end_time:
+      builder.make_data(entity, 'Time', 'Running since {0}'.format(offset))
+    else:
+      builder.make_data(
+          entity, 'Time',
+          '{0} secs + {1}'.format(offset, (end_time - start_time) / 1000.0))
+
+  def _export_error_info(self, container, builder, entity):
+    """Helper function to write Status entry error info to SnapshotableEntity.
+
+    Has no effect if errors could not be found in the container.
+
+    Args:
+      container [dict]: Excerpt from Status response to look for errors.
+    """
+    message = []
+    if 'error' in container:
+      message.append(container['error'])
+
+    details = container.get('details', {})
+    error_list = details.get('errors', [])
+    if error_list:
+      message.extend(['*  ' + str(err) for err in error_list])
+    if not message:
+      return
+    builder.make(entity, 'Error(s)',
+                 '\n'.join(message), relation='ERROR', format='pre')
 
 
 class SpinnakerAgent(service_testing.HttpAgent):
@@ -420,7 +503,7 @@ class SpinnakerAgent(service_testing.HttpAgent):
     # near this, but care more about eventual correctness than timeliness
     # here. We can capture timing information and look at it after the fact
     # to make performance related conclusions.
-    self.default_max_wait_secs = 360
+    self.default_max_wait_secs = 600
 
   def _new_messaging_status(self, operation, http_response):
     """Implements HttpAgent interface."""
@@ -504,7 +587,7 @@ class SpinnakerAgent(service_testing.HttpAgent):
     if not got:
       return None
 
-    tar = tarfile.open(mode='r', fileobj=StringIO(base64.b64decode(got)))
+    tar = tarfile.open(mode='r', fileobj=BytesIO(base64.b64decode(got)))
 
     try:
       entry = tar.extractfile('etc/default/spinnaker')
@@ -527,7 +610,7 @@ class SpinnakerAgent(service_testing.HttpAgent):
       except KeyError:
         continue
 
-      logger.info('Importing configuration from ' + member)
+      logger.info('Importing configuration from %s', member)
       yaml_accumulator.load_string(entry.read(), config_dict)
 
     return config_dict

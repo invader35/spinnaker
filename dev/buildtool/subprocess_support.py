@@ -29,14 +29,13 @@ from buildtool import (
     timedelta_string,
     ExecutionError)
 
-from base_metrics import BaseMetricsRegistry
+from buildtool.base_metrics import BaseMetricsRegistry
 
 
 # Directory where error logfiles are copied to.
 # This is exposed so it can be configured externally since
 # this module does not offer encapsulated configuration.
 ERROR_LOGFILE_DIR = 'errors'
-
 
 def start_subprocess(cmd, stream=None, stdout=None, echo=False, **kwargs):
   """Starts a subprocess and returns handle to it."""
@@ -77,15 +76,24 @@ def wait_subprocess(process, stream=None, echo=False, postprocess_hook=None):
     Process exit code, stdout remaining in process prior to this invocation.
     Any previously read output from the process will not be included.
   """
-  stdout_lines = []
+  text_lines = []
   if process.stdout is not None:
     # stdout isnt going to another stream; collect it from the pipe.
-    for line in iter(process.stdout.readline, ''):
-      stdout_lines.append(line)
+    for raw_line in iter(process.stdout.readline, ''):
+      if not raw_line:
+        break
+      decoded_line = raw_line.decode(encoding='utf-8')
+      text_lines.append(decoded_line)
       if stream:
-        stream.write(line)
+        stream.write(raw_line)
         stream.flush()
+   
   process.wait()
+  if stream is None:
+    # Close stdout pipe if we didnt give a stream.
+    # Otherwise caller owns the stream.
+    process.stdout.close()
+
   if hasattr(process, 'start_date'):
     end_date = datetime.datetime.now()
     delta_time_str = timedelta_string(end_date - process.start_date)
@@ -93,7 +101,7 @@ def wait_subprocess(process, stream=None, echo=False, postprocess_hook=None):
     delta_time_str = 'UNKNOWN'
 
   returncode = process.returncode
-  stdout = ''.join(stdout_lines)
+  stdout = ''.join(text_lines)
 
   if stream:
     stream.write(
@@ -136,8 +144,8 @@ def check_subprocess(cmd, stream=None, **kwargs):
     logging.error('Command failed. See embedded output above.')
   else:
     lines = stdout.split('\n')
-    if lines > 10:
-      lines = lines[-10:]
+    if lines > 30:
+      lines = lines[-30:]
     log_embedded_output(logging.ERROR,
                         'Command failed with last %d lines' % len(lines),
                         '\n'.join(lines))
@@ -188,18 +196,25 @@ def check_subprocesses_to_logfile(what, logfile, cmds, append=False, **kwargs):
     try:
       check_subprocess_sequence(
           cmds, stream=stream, embed_errors=False, **kwargs)
-    except Exception:
+    except Exception as ex:
       logging.error('%s failed. Log file [%s] follows:', what, logfile)
-      with open(logfile, 'r') as readagain:
-        output = readagain.read()
+      import traceback
+      traceback.print_exc()
+
+      with open(logfile, 'rb') as readagain:
+        output = bytes.decode(readagain.read(), encoding='utf-8')
         log_embedded_output(logging.ERROR, logfile, output)
-      logging.error('%s failed. See embedded logfile above', what)
+      logging.error('Caught exception %s\n%s failed. See embedded logfile above',
+                    ex, what)
 
       ensure_dir_exists(ERROR_LOGFILE_DIR)
       error_path = os.path.join('errors', os.path.basename(logfile))
       logging.info('Copying error log file to %s', error_path)
       with open(error_path, 'w') as f:
-        f.write(output)
+        f.write(output);
+        f.write('\n--------\n')
+        f.write('Exeception caught in parent process:\n%s' % ex)
+
       raise
 
 

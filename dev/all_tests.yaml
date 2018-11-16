@@ -33,19 +33,25 @@ tests:
         jenkins_master_enabled: true
       services: [clouddriver, echo, front50, gate, igor, orca, rosco]
     quota:
-      google_cpu: 1
-      google_forwarding_rules: 1
+      gce_region_IN_USE_ADDRESSES: 1
+      gce_region_INSTANCE_GROUP_MANAGERS: 1
+      gce_region_CPUS: 1
+      gce_region_INSTANCE_GROUPS: 1
+      gce_global_FORWARDING_RULES: 1
+      gce_global_HEALTH_CHECKS: 1
+      gce_global_FORWARDING_RULES: 1
+      gce_global_TARGET_POOLS: 1
     api: gate
     args:
       alias: [standard_google_provider_params]
       test_google:
       jenkins_token: TRIGGER_TOKEN
-      jenkins_job: NoOpTrigger
+      jenkins_job: $test_jenkins_job_name
       jenkins_url: $jenkins_master_address
       jenkins_master: $jenkins_master_name
       jenkins_master_user: $jenkins_master_user
 
-  google_front50_test:
+  gcs_front50_test:
     requires:
       configuration:
         spinnaker_storage: gcs
@@ -62,7 +68,7 @@ tests:
         # I'm disabling this test in k8s for now. It shouldnt be sensitive to
         # the deployment environment so gce deployments are sufficient to confirm
         # front50 working correctly (and other k8s tests use it indirectly).
-        deploy_spinnaker_type: localdebian
+        # deploy_spinnaker_type: localdebian
 
       services: [front50]
     api: front50
@@ -79,9 +85,12 @@ tests:
       services: [clouddriver]
     api: clouddriver
     quota:
-      google_cpu: 1
-      google_backend_services: 1
-      google_forwarding_rules: 2
+      gce_region_IN_USE_ADDRESSES: 3
+      gce_region_CPUS: 3
+      gce_global_IN_USE_ADDRESSES: 1
+      gce_global_FORWARDING_RULES: 1
+      gce_global_HEALTH_CHECKS: 1
+      gce_global_TARGET_POOLS: 1
     args:
       alias: [standard_google_provider_params]
 
@@ -91,8 +100,16 @@ tests:
         google_account_enabled: true
       services: [clouddriver, front50, gate, orca]
     quota:
-      google_cpu: 3
-      google_forwarding_rules: 1
+      gce_region_IN_USE_ADDRESSES: 2
+      gce_region_INSTANCE_GROUP_MANAGERS: 1
+      gce_region_CPUS: 2
+      gce_global_IN_USE_ADDRESSES: 2
+      gce_global_TARGET_HTTP_PROXIES: 1
+      gce_global_BACKEND_SERVICES: 1
+      gce_global_URL_MAPS: 1
+      gce_global_HEALTH_CHECKS: 2
+      gce_global_FORWARDING_RULES: 1
+      gce_global_TARGET_POOLS: 1
     path: citest/tests/google_server_group_test.py
     api: gate
     args:
@@ -104,8 +121,12 @@ tests:
         google_account_enabled: true
       services: [clouddriver, front50, gate, orca]
     quota:
-      google_cpu: 3
-      google_forwarding_rules: 1
+      gce_region_IN_USE_ADDRESSES: 3
+      gce_region_REGIONAL_INSTANCE_GROUP_MANAGERS: 2
+      gce_region_CPUS: 3
+      gce_global_IN_USE_ADDRESSES: 1
+      gce_global_FORWARDING_RULES: 1
+      gce_global_TARGET_POOLS: 1
     path: citest/tests/google_server_group_test.py
     api: gate
     args:
@@ -118,8 +139,17 @@ tests:
         google_account_enabled: true
       services: [clouddriver, front50, gate, orca]
     quota:
-      google_cpu: 2
-      google_forwarding_rules: 1
+      gce_region_IN_USE_ADDRESSES: 2
+      gce_region_INSTANCE_GROUP_MANAGERS: 1
+      gce_region_CPUS: 2
+      gce_region_INSTANCE_GROUPS: 1
+      gce_global_IN_USE_ADDRESSES: 2
+      gce_global_TARGET_HTTP_PROXIES: 1
+      gce_global_BACKEND_SERVICES: 1
+      gce_global_URL_MAPS: 1
+      gce_global_HEALTH_CHECKS: 2
+      gce_global_FORWARDING_RULES: 2
+      gce_global_TARGET_POOLS: 1
     api: gate
     args:
       alias: [standard_google_provider_params]
@@ -130,9 +160,14 @@ tests:
         google_account_enabled: true
       services: [clouddriver, front50, gate, orca]
     quota:
-      google_backend_services: 3
-      google_cpu: 2
-      google_ssl_certificates: 2
+      gce_global_IN_USE_ADDRESSES: 1
+      gce_global_TARGET_HTTP_PROXIES: 1
+      gce_global_BACKEND_SERVICES: 3
+      gce_global_SSL_CERTIFICATES: 1
+      gce_global_URL_MAPS: 1
+      gce_global_HEALTH_CHECKS: 2
+      gce_global_FORWARDING_RULES: 1
+      gce_global_FIREWALLS: 1
     api: gate
     args:
       alias: [standard_google_provider_params]
@@ -143,9 +178,19 @@ tests:
         google_account_enabled: true
       services: [clouddriver, front50, gate, orca]
     quota:
-      google_backend_services: 3
-      google_cpu: 2
-      google_ssl_certificates: 2
+      gce_region_IN_USE_ADDRESSES: 1
+      gce_region_INSTANCE_GROUP_MANAGERS: 1
+      gce_region_CPUS: 1
+      gce_region_INSTANCE_GROUPS: 1
+      gce_global_IN_USE_ADDRESSES: 1
+      gce_global_TARGET_HTTP_PROXIES: 1
+      gce_global_BACKEND_SERVICES: 3
+      gce_global_SSL_CERTIFICATES: 1
+      gce_global_TARGET_HTTPS_PROXIES: 1
+      gce_global_URL_MAPS: 1
+      gce_global_HEALTH_CHECKS: 2
+      gce_global_FORWARDING_RULES: 1
+      gce_global_FIREWALLS: 1
     api: gate
     args:
       alias: [standard_google_provider_params]
@@ -159,6 +204,62 @@ tests:
     args:
       spinnaker_kubernetes_account: $k8s_account_name
       test_namespace: $k8s_account_namespaces
+
+  kube_v2_smoke_test:
+    requires:
+      configuration:
+        k8s_v2_account_enabled: true
+      services: [clouddriver, front50, gate, orca]
+    api: gate
+    args:
+      spinnaker_kubernetes_v2_account: $k8s_v2_account_name
+      test_namespace: $k8s_v2_account_namespaces
+
+  kube_v2_cache_test:
+    requires:
+      configuration:
+        k8s_v2_account_enabled: true
+      services: [clouddriver, front50, gate, orca]
+    api: gate
+    args:
+      spinnaker_kubernetes_v2_account: $k8s_v2_account_name
+      test_namespace: $k8s_v2_account_namespaces
+
+  kube_v2_gcs_test:
+    requires:
+      configuration:
+        k8s_v2_account_enabled: true
+      services: [clouddriver, front50, gate, orca]
+    api: gate
+    args:
+      spinnaker_kubernetes_v2_account: $k8s_v2_account_name
+      test_namespace: $k8s_v2_account_namespaces
+      test_gcs_artifact_account: $artifact_gcs_account_name
+      test_gcs_bucket: $artifact_gcs_bucket
+      test_gcs_credentials_path: $artifact_gcs_credentials
+
+  kube_v2_helm_test:
+    requires:
+      configuration:
+        k8s_v2_account_enabled: true
+      services: [clouddriver, front50, gate, orca]
+    api: gate
+    args:
+      spinnaker_kubernetes_v2_account: $k8s_v2_account_name
+      test_namespace: $k8s_v2_account_namespaces
+      test_gcs_artifact_account: $artifact_gcs_account_name
+      test_gcs_bucket: $artifact_gcs_bucket
+      test_gcs_credentials_path: $artifact_gcs_credentials
+
+  kube_v2_artifact_test:
+    requires:
+      configuration:
+        k8s_v2_account_enabled: true
+      services: [clouddriver, front50, gate, orca]
+    api: gate
+    args:
+      spinnaker_kubernetes_v2_account: $k8s_v2_account_name
+      test_namespace: $k8s_v2_account_namespaces
 
   aws_kato_test:
     requires:
@@ -192,8 +293,6 @@ tests:
       configuration:
         appengine_account_enabled: true
       services: [clouddriver, front50, gate, orca]
-    quota:
-      appengine_deployment: 1
     path: citest/tests/appengine_smoke_test.py
     api: gate
     args:
@@ -207,8 +306,6 @@ tests:
       configuration:
         appengine_account_enabled: true
       services: [clouddriver, front50, gate, orca]
-    quota:
-      appengine_deployment: 1
     path: citest/tests/appengine_smoke_test.py
     api: gate
     args:
@@ -218,16 +315,13 @@ tests:
       test_gcs_bucket: $storage_gcs_bucket
       branch: master
 
-  gcs_pubsub_gae_test:
+  appengine_gcs_pubsub_test:
     requires:
       configuration:
         appengine_account_enabled: true
         gcs_pubsub_enabled: true
         pubsub_google_enabled: true
       services: [clouddriver, front50, gate, orca, echo]
-    quota:
-      appengine_deployment: 1
-    path: citest/tests/gcs_pubsub_gae_test.py
     api: gate
     args:
       alias: [standard_appengine_provider_params]

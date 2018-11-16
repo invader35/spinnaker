@@ -120,11 +120,38 @@ class GitRepositorySpec(object):
         origin=self.__origin,
         upstream=self.__upstream)
 
+  def __lt__(self, other):
+    if self.__name != other.name:
+      return self.__name < other.name
+
+    # a partial ordering would be fine, but we want strict __eq__ for testing
+    self_hash = hash((self.__git_dir, self.__origin, self.__upstream))
+    other_hash = hash((other.git_dir, other.origin, other.upstream))
+    return  self_hash < other_hash
+
+  def __le__(self, other):
+    return self.__lt__(other) or self.__eq__(other)
+
   def __eq__(self, other):
     return (self.__name == other.name
             and self.__git_dir == other.git_dir_or_none()
             and self.__origin == other.origin_or_none()
             and self.__upstream == other.upstream_or_none())
+
+  def __ne__(self, other):
+    return not self.__eq__(other)
+
+  def __ge__(self, other):
+    return self.__gt__(other) or self.__eq__(other)
+
+  def __gt__(self, other):
+    if self.__name != other.name:
+      return self.__name > other.name
+
+    # a partial ordering would be fine, but we want strict __eq__ for testing
+    self_hash = hash((self.__git_dir, self.__origin, self.__upstream))
+    other_hash = hash((other.git_dir, other.origin, other.upstream))
+    return  self_hash > other_hash
 
 
 class SemanticVersion(
@@ -291,7 +318,7 @@ class CommitMessage(
       # Some tags indicate only a patch release.
       re.compile(r'^\s*'
                  r'(?:\*\s+)?'
-                 r'((?:fix|bug|docs?|test)[\(:].*)',
+                 r'((?:fix|bug|chore|docs?|test)[\(:].*)',
                  re.MULTILINE)
   ]
   DEFAULT_MINOR_REGEXS = [
@@ -300,7 +327,7 @@ class CommitMessage(
       # implementation changes that suggest a higher level of risk.
       re.compile(r'^\s*'
                  r'(?:\*\s+)?'
-                 r'((?:feat|feature|chore|refactor|perf|config)[\(:].*)',
+                 r'((?:feat|feature|refactor|perf|config)[\(:].*)',
                  re.MULTILINE)
   ]
   DEFAULT_MAJOR_REGEXS = [
@@ -505,8 +532,19 @@ class CommitMessage(
   def to_yaml(self):
     """Convert the summary to a yaml string."""
     data = dict(self._asdict())
-    return yaml.dump(data, default_flow_style=False)
+    return yaml.safe_dump(data, default_flow_style=False)
 
+  def _asdict(self):
+    """Override broken method in some Python3
+
+    https://bugs.python.org/issue24931
+    """
+    return collections.OrderedDict([
+        ('commit_id', self.commit_id),
+        ('author', self.author),
+        ('date', self.date),
+        ('message', self.message)
+    ])
 
 class RepositorySummary(collections.namedtuple(
     'RepositorySummary',
@@ -558,7 +596,20 @@ class RepositorySummary(collections.namedtuple(
     else:
       del data['commit_messages']
 
-    return yaml.dump(data, default_flow_style=False)
+    return yaml.safe_dump(data, default_flow_style=False)
+
+  def _asdict(self):
+    """Override broken method in some Python3
+
+    https://bugs.python.org/issue24931
+    """
+    return collections.OrderedDict([
+        ('commit_id', self.commit_id),
+        ('tag', self.tag),
+        ('version', self.version),
+        ('prev_version', self.prev_version),
+        ('commit_messages', self.commit_messages)
+    ])
 
 
 class GitRunner(object):
@@ -582,10 +633,11 @@ class GitRunner(object):
         help='If True, github pull origin uses ssh rather than https.'
              ' Pulls are https by default since the standard repos are public.')
     add_parser_argument(
-        parser, 'github_filesystem_root', defaults, None,
-        help='If set, then use this file path as the base origin root where'
-             ' all the git repositories are assumed off that. This is only'
-             ' intended to support testing.')
+        parser, 'github_repository_root', defaults, None,
+        help='If set, then use this as the base repository for github.'
+             ' This is intended for urls other than https and ssh,'
+             ' such as filesystems for testing.'
+             ' Otherwise, use github_hostname, github_(push|pull)_ssh.')
     add_parser_argument(
         parser, 'github_push_ssh', defaults, True, type=bool,
         help='If False, github push origin uses https rather than ssh.'
@@ -748,9 +800,13 @@ class GitRunner(object):
     We'll use this to know that the changes since the tag are X, Y, Z,
     and be able to determine the new semantic version tag based on 0.2.0 even
     though it is not directly in <id>'s hierarchy.
+
+    Args:
+      base_commit_id [string]: If base_commit_id is provided then rather than
+          use it ias the base commit id for determining recent commits.
     """
     # Find the starting commit, which is most recent tag in our direct history.
-    # For the example in the function docs, this would be tat 0.1.0
+    # For the example in the function docs, this would be tag 0.1.0
     retcode, most_recent_ancestor_tag = self.run_git(
         git_dir, 'describe --abbrev=0 --tags --match version-* ' + commit_id)
     if retcode != 0:
@@ -815,20 +871,20 @@ class GitRunner(object):
 
     return start_tag, start_commit
 
-
   def query_local_repository_commits_to_existing_tag_from_id(
-      self, git_dir, commit_id, commit_tags):
+      self, git_dir, commit_id, commit_tags, base_commit_id=None):
     """Returns the list of commit messages to the local repository."""
     # pylint: disable=invalid-name
 
     tag, found_commit = self.find_newest_tag_and_common_commit_from_id(
         git_dir, commit_id, commit_tags)
 
-    result = self.check_run(
+    base_commit = base_commit_id or found_commit
+    commit_history = self.check_run(
         git_dir,
-        'log --pretty=medium {found_commit}..{id}'.format(
-            found_commit=found_commit, id=commit_id))
-    messages = CommitMessage.make_list_from_result(result)
+        'log --pretty=medium {base_commit}..{id}'.format(
+            base_commit=base_commit, id=commit_id))
+    messages = CommitMessage.make_list_from_result(commit_history)
     return tag, messages
 
   def query_commit_at_tag(self, git_dir, tag):
@@ -908,6 +964,21 @@ class GitRunner(object):
 
     logging.debug('Pushing tag "%s" and pushing to origin in %s', tag, git_dir)
     self.check_run(git_dir, 'push origin ' + tag)
+
+  def fetch_tags(self, git_dir, remote_name='origin'):
+    """Fetches the tags in the given remote as a list.
+
+    Args:
+      git_dir: [string] Which local repository to update.
+      remote_name: [remote_name] Which remote repository to pull from.
+
+    Returns:
+      A list of tags.
+    """
+    logging.debug('Fetching tags for %s from remote %s', git_dir, remote_name)
+    self.check_run(git_dir, 'fetch --tags')
+    raw_tags = self.check_run(git_dir, 'tag')
+    return [s.strip() for s in raw_tags.split('\n')]
 
   def refresh_local_repository(self, git_dir, remote_name, branch):
     """Refreshes the given local repository from the remote one.
@@ -999,6 +1070,22 @@ class GitRunner(object):
     self.check_run(git_dir, 'tag -d ' + ' '.join(tags_to_remove))
     logging.debug('%d of %d tags removed', len(tags_to_remove), len(all_tags))
 
+  def determine_pull_url(self, repository):
+    """Return the pull URL for a given repository from its origin."""
+    parts = self.normalize_repo_url(repository.origin)
+    if len(parts) == 3:
+      return (self.make_ssh_url(*parts) if self.__options.github_pull_ssh
+              else self.make_https_url(*parts))
+    return repository.origin
+
+  def determine_push_url(self, repository):
+    """Return the push URL for a given repository from its origin."""
+    parts = self.normalize_repo_url(repository.origin)
+    if len(parts) == 3:
+      return (self.make_ssh_url(*parts) if self.__options.github_push_ssh
+              else self.make_https_url(*parts))
+    return repository.origin
+
   def clone_repository_to_path(
       self, repository, commit=None, branch=None, default_branch=None):
     """Clone the remote repository at the given commit or branch.
@@ -1012,14 +1099,7 @@ class GitRunner(object):
       raise_and_log_error(
           ConfigError('At most one of commit or branch can be specified.'))
 
-    origin = repository.origin
-    parts = self.normalize_repo_url(repository.origin)
-    if len(parts) == 3:
-      pull_url = (self.make_ssh_url(*parts) if self.__options.github_pull_ssh
-                  else self.make_https_url(*parts))
-    else:
-      pull_url = origin
-
+    pull_url = self.determine_pull_url(repository)
     git_dir = repository.git_dir
     logging.debug('Begin cloning %s', pull_url)
     parent_dir = os.path.dirname(git_dir)
@@ -1039,6 +1119,7 @@ class GitRunner(object):
       self.check_run(git_dir, 'checkout -q ' + commit, echo=True)
 
     upstream = repository.upstream_or_none()
+    origin = repository.origin
     if upstream and not self.is_same_repo(upstream, origin):
       logging.debug('Adding upstream %s with disabled push', upstream)
       self.check_run(git_dir, 'remote add upstream ' + upstream)
@@ -1054,8 +1135,7 @@ class GitRunner(object):
       if len(parts) == 3:
         # Origin is not a local path
         logging.debug('Fixing origin push url')
-        push_url = (self.make_ssh_url(*parts) if self.__options.github_push_ssh
-                    else self.make_https_url(*parts))
+        push_url = self.determine_push_url(repository)
         self.check_run(git_dir, 'remote set-url --push origin ' + push_url)
 
     logging.debug('Finished cloning %s', pull_url)
@@ -1097,7 +1177,7 @@ class GitRunner(object):
                              origin=origin_url,
                              upstream=remote_urls.get('upstream'))
 
-  def collect_repository_summary(self, git_dir):
+  def collect_repository_summary(self, git_dir, base_commit_id=None):
     """Collects RepsitorySummary from local repository directory."""
     start_time = time.time()
     logging.debug('Begin analyzing %s', git_dir)
@@ -1105,7 +1185,7 @@ class GitRunner(object):
         git_dir, r'^version-[0-9]+\.[0-9]+\.[0-9]+$')
     current_id = self.query_local_repository_commit_id(git_dir)
     tag, msgs = self.query_local_repository_commits_to_existing_tag_from_id(
-        git_dir, current_id, all_tags)
+        git_dir, current_id, all_tags, base_commit_id=base_commit_id)
 
     if not tag:
       current_semver = SemanticVersion.make('version-0.0.0')

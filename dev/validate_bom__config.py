@@ -219,6 +219,12 @@ class GcsArtifactStorageConfiguratorHelper(Configurator):
   def init_argument_parser(cls, parser, defaults):
     """Implements interface."""
     add_parser_argument(
+        parser, 'artifact_gcs_bucket', defaults, None,
+        help='The name of the bucket to create.')
+    add_parser_argument(
+        parser, 'artifact_gcs_project', defaults, None,
+        help='The name of the project the bucket to create lives in.')
+    add_parser_argument(
         parser, 'artifact_gcs_credentials', defaults, None,
         help='Path to google credentials file to configure spinnaker'
              ' artifact storage.')
@@ -246,10 +252,47 @@ class GcsArtifactStorageConfiguratorHelper(Configurator):
           'hal -q --log=info config artifact gcs account add {name}'
           .format(name=options.artifact_gcs_account_name))
       if options.artifact_gcs_credentials:
-        hal += (' --json-path ./{filename}'
-                .format(filename=os.path.basename(
-                    options.artifact_gcs_credentials)))
+        hal += (' --json-path ' + os.path.basename(
+                    options.artifact_gcs_credentials))
       script.append(hal)
+
+  @staticmethod
+  def __instantiate_client(options):
+    """Instantiates and returns storage client.
+    """
+    scopes = [
+        'https://www.googleapis.com/auth/devstorage.full_control',
+        'https://www.googleapis.com/auth/cloud-platform',
+    ]
+    credentials = service_account.Credentials.from_service_account_file(
+        options.artifact_gcs_credentials,
+        scopes=scopes)
+    storage_client = storage.Client(credentials=credentials,
+                                    project=options.artifact_gcs_project)
+    return storage_client
+
+  @classmethod
+  def setup_environment(cls, options):
+    """Implements interface."""
+    if options.artifact_gcs_bucket is None:
+      return
+
+    storage_client = GcsArtifactStorageConfiguratorHelper.__instantiate_client(options)
+    if storage_client.lookup_bucket(options.artifact_gcs_bucket) is None:
+      created_bucket = storage_client.create_bucket(options.artifact_gcs_bucket)
+      logging.debug('Created bucket for Artifact storage: %s', created_bucket)
+
+  @classmethod
+  def teardown_environment(cls, options):
+    """Implements interface."""
+    if options.artifact_gcs_bucket is None:
+      return
+
+    storage_client = GcsArtifactStorageConfiguratorHelper.__instantiate_client(options)
+    bucket = storage_client.lookup_bucket(options.artifact_gcs_bucket)
+    if bucket is not None:
+      bucket.delete(force=True)
+      logging.debug('Deleted bucket for Artifact storage: %s', bucket)
 
 
 class GcsStorageConfiguratorHelper(Configurator):
@@ -345,6 +388,16 @@ class ArtifactConfigurator(Configurator):
     """Implements interface."""
     for helper in self.HELPERS:
       helper.add_config(options, script)
+
+  def setup_environment(self, options):
+    """Implements interface."""
+    for helper in self.HELPERS:
+      helper.setup_environment(options)
+
+  def teardown_environment(self, options):
+    """Implements interface."""
+    for helper in self.HELPERS:
+      helper.teardown_environment(options)
 
 
 class StorageConfigurator(Configurator):
@@ -770,6 +823,9 @@ class GoogleConfigurator(Configurator):
     add_parser_argument(
         parser, 'google_account_name', defaults, 'my-google-account',
         help='The name of the primary google account to configure.')
+    add_parser_argument(
+        parser, 'google_account_regions', defaults, None,
+        help='The Google Cloud regions this account should manage.')
 
   def validate_options(self, options):
     """Implements interface."""
@@ -793,6 +849,10 @@ class GoogleConfigurator(Configurator):
         '--project', options.google_account_project,
         '--json-path', os.path.basename(options.google_account_credentials)])
 
+    if options.google_account_regions:
+      account_params.extend([
+        '--regions', options.google_account_regions])
+
     script.append('hal -q --log=info config provider google enable')
     if options.deploy_google_zone:
       script.append('hal -q --log=info config provider google bakery edit'
@@ -805,6 +865,57 @@ class GoogleConfigurator(Configurator):
     """Implements interface."""
     if options.google_account_credentials:
       file_set.add(options.google_account_credentials)
+
+class KubernetesV2Configurator(Configurator):
+  """Controls hal config provider kubernetes (for v2 accounts)."""
+
+  def init_argument_parser(self, parser, defaults):
+    """Implements interface."""
+    add_parser_argument(
+        parser, 'k8s_v2_account_credentials', defaults, None,
+        help='Path to k8s credentials file.')
+    add_parser_argument(
+        parser, 'k8s_v2_account_name', defaults, 'my-kubernetes-v2-account',
+        help='The name of the primary Kubernetes account to configure.')
+    add_parser_argument(
+        parser, 'k8s_v2_account_context', defaults, None,
+        help='The kubernetes context for the primary Kubernetes v2 account.')
+    add_parser_argument(
+        parser, 'k8s_v2_account_namespaces', defaults, 'validate-bom',
+        help='The kubernetes namespaces for the primary Kubernetes v2 account.'
+    )
+
+  def validate_options(self, options):
+    """Implements interface."""
+    pass
+
+  def add_config(self, options, script):
+    """Implements interface."""
+    options.k8s_v2_account_enabled = options.k8s_v2_account_credentials is not None
+    if not options.k8s_v2_account_enabled:
+      return
+
+    account_params = [options.k8s_v2_account_name]
+    account_params.extend([
+        '--kubeconfig-file',
+        os.path.basename(options.k8s_v2_account_credentials),
+        '--provider-version',
+        'v2'
+    ])
+    if options.k8s_v2_account_context:
+      account_params.extend(['--context', options.k8s_v2_account_context])
+    if options.k8s_v2_account_namespaces:
+      account_params.extend(['--namespaces', options.k8s_v2_account_namespaces])
+
+    script.append('hal -q --log=info config provider kubernetes enable')
+    script.append('hal -q --log=info config provider kubernetes account'
+                  ' add {params}'
+                  .format(params=' '.join(account_params)))
+
+  def add_files_to_upload(self, options, file_set):
+    """Implements interface."""
+    if options.k8s_v2_account_credentials:
+      file_set.add(options.k8s_v2_account_credentials)
 
 
 class KubernetesConfigurator(Configurator):
@@ -1139,7 +1250,9 @@ class GcsPubsubNotficationConfigurator(Configurator):
     subscription_ref = subscriber_client.subscription_path(
         options.gcs_pubsub_project, options.gcs_pubsub_subscription)
     subscriber_client.create_subscription(subscription_ref, topic_ref)
-    storage_client.create_bucket(options.gcs_pubsub_bucket)
+    if storage_client.lookup_bucket(options.gcs_pubsub_bucket) is None:
+      created_bucket = storage_client.create_bucket(options.gcs_pubsub_bucket)
+      logging.debug('Created bucket for Pub/Sub artifacts: %s', created_bucket)
 
     bucket = storage_client.get_bucket(options.gcs_pubsub_bucket)
     notification = bucket.notification(
@@ -1155,9 +1268,16 @@ class GcsPubsubNotficationConfigurator(Configurator):
 
     publisher_client, subscriber_client, storage_client = self.__instantiate_clients(options)
 
-    subscriber_client.delete_subscription(options.gcs_pubsub_subscription)
-    publisher_client.delete_topic(options.gcs_pubsub_topic)
-    storage_client.delete_bucket(options.gcs_pubsub_bucket)
+    # Pub/sub names must contain the project and collection type as specified
+    # in the spec: https://cloud.google.com//pubsub/docs/admin#resource_names.
+    subscriber_client.delete_subscription(subscriber_client.subscription_path(
+        options.gcs_pubsub_project, options.gcs_pubsub_subscription))
+    publisher_client.delete_topic(publisher_client.topic_path(
+        options.gcs_pubsub_project, options.gcs_pubsub_topic))
+    bucket = storage_client.lookup_bucket(options.gcs_pubsub_bucket)
+    if bucket is not None:
+      bucket.delete(force=True)
+      logging.debug('Deleted bucket for Pub/Sub artifacts: %s', bucket)
 
 
 class JenkinsConfigurator(Configurator):
@@ -1278,6 +1398,8 @@ class LoggingConfigurator(Configurator):
   def add_init(self, options, script):
     """Implements interface."""
 
+    script.append('ntpq -p || true')
+
     if not options.google_cloud_logging:
       return
 
@@ -1296,12 +1418,17 @@ class MonitoringConfigurator(Configurator):
              ' configure to use the gateway server at thsi URL.')
     add_parser_argument(
         parser, 'monitoring_install_which', defaults, None,
-        help='If provided, install monitoring with these params.')
+        help='If provided, install monitoring with these params.'
+             'This can be a comma-delimited list of services to use.')
+    add_parser_argument(
+        parser, 'monitoring_filter_dir', defaults, None,
+        help='If provided, use the metric fitlers in filter_dir.')
 
   def validate_options(self, options):
     """Implements interface."""
+    options.monitoring_which_list = options.monitoring_install_which.split(',')
     if (options.monitoring_prometheus_gateway
-        and (options.monitoring_install_which != 'prometheus')):
+        and 'prometheus' not in options.monitoring_which_list):
       raise ValueError('gateway is only applicable to '
                        ' --monitoring_install_which="prometheus"')
 
@@ -1346,9 +1473,16 @@ class MonitoringConfigurator(Configurator):
       return
 
     # Start up monitoring now so we can monitor these VMs
-    if (options.monitoring_install_which == 'prometheus'
+    if ('prometheus' in options.monitoring_which_list
         and options.deploy_spinnaker_type == 'localdebian'):
       self.__inject_prometheus_node_exporter(options, script)
+
+  def add_files_to_upload(self, options, file_set):
+    if options.monitoring_filter_dir:
+      logging.info('Taring %s', options.monitoring_filter_dir)
+      os.system('tar cf monitoring_filters.tar -C %s .'
+                % options.monitoring_filter_dir)
+      file_set.add('monitoring_filters.tar')
 
   def add_config(self, options, script):
     """Implements interface."""
@@ -1359,12 +1493,20 @@ class MonitoringConfigurator(Configurator):
     script.append('echo "host: 0.0.0.0"'
                   ' > ~/.hal/default/service-settings/monitoring-daemon.yml')
 
-    script.append('hal -q --log=info config metric-stores {which} enable'
-                  .format(which=options.monitoring_install_which))
+    for which in options.monitoring_which_list:
+      script.append('hal -q --log=info config metric-stores {which} enable'
+                    .format(which=which))
     if options.monitoring_prometheus_gateway:
       script.append('hal -q --log=info config metric-stores prometheus edit'
                     ' --push-gateway {gateway}'
                     .format(gateway=options.monitoring_prometheus_gateway))
+    if options.monitoring_filter_dir:
+      # Unpack the tar file into halyard's config directory.
+      script.extend([
+          'mkdir -p ~/.hal/default/profiles/monitoring-daemon/filters',
+          'tar xf monitoring_filters.tar'
+             ' --directory ~/.hal/default/profiles/monitoring-daemon/filters'
+      ])
 
 
 class NotificationConfigurator(Configurator):
@@ -1393,11 +1535,72 @@ class SpinnakerConfigurator(Configurator):
     script.append('mkdir -p  ~/.hal/default/profiles')
     script.append('echo "management.security.enabled: false"'
                   ' > ~/.hal/default/profiles/spinnaker-local.yml')
+    hystrix_config = '''\
+hystrix:
+  threadpool:
+    default:
+      maxQueueSize: 100
+      queueSizeRejectionThreshold: 100
+'''
+    script.append('echo "{}" > ~/.hal/default/profiles/gate-local.yml'.format(hystrix_config))
+    script.append('echo "{}" > ~/.hal/default/profiles/front50-local.yml'.format(hystrix_config))
 
   def add_files_to_upload(self, options, file_set):
     """Implements interface."""
     pass
 
+
+class HaConfigurator(Configurator):
+  """Controls hal config deploy ha (only supported by distributed deployments with a Kubernetes v2 account)."""
+
+  def init_argument_parser(self, parser, defaults):
+    """Implements interface."""
+    add_parser_argument(
+        parser, 'ha_clouddriver_enabled', defaults, False, type=bool,
+        help='Whether or not to deploy clouddriver in HA mode.')
+    add_parser_argument(
+        parser, 'ha_clouddriver_redis_master_endpoint', defaults, None,
+        help='The endpoint of the clouddriver Redis master service')
+    add_parser_argument(
+        parser, 'ha_clouddriver_redis_slave_endpoint', defaults, None,
+        help='The endpoint of the clouddriver Redis slave service')
+    add_parser_argument(
+        parser, 'ha_echo_enabled', defaults, False, type=bool,
+        help='Whether or not to deploy echo in HA mode.')
+
+  def validate_options(self, options):
+    """Implements interface."""
+    options.ha_enabled = (
+        options.ha_clouddriver_enabled
+        or options.ha_echo_enabled)
+    if options.ha_clouddriver_enabled:
+      if (options.ha_clouddriver_redis_master_endpoint is None) != (options.ha_clouddriver_redis_slave_endpoint is None):
+        raise ValueError('Either both --ha_clouddriver_redis_master_endpoint'
+                         ' and --ha_clouddriver_redis_slave_endpoint or neither'
+                         ' of them must be supplied.')
+
+  def add_config(self, options, script):
+    """Implements interface."""
+    if options.ha_clouddriver_enabled:
+      script.append('hal -q --log=info config deploy ha clouddriver enable')
+
+      ha_clouddriver_params = []
+      if options.ha_clouddriver_redis_master_endpoint is not None:
+        ha_clouddriver_params.extend(['--redis-master-endpoint',
+                                      options.ha_clouddriver_redis_master_endpoint])
+      if options.ha_clouddriver_redis_slave_endpoint is not None:
+        ha_clouddriver_params.extend(['--redis-slave-endpoint',
+                                      options.ha_clouddriver_redis_slave_endpoint])
+      if ha_clouddriver_params:
+        script.append('hal -q --log=info config deploy ha clouddriver edit {params}'
+                      .format(params=' '.join(ha_clouddriver_params)))
+
+    if options.ha_echo_enabled:
+      script.append('hal -q --log=info config deploy ha echo enable')
+
+  def add_files_to_upload(self, options, file_set):
+    """Implements interface."""
+    pass
 
 
 CONFIGURATOR_LIST = [
@@ -1413,12 +1616,14 @@ CONFIGURATOR_LIST = [
     DcosConfigurator(),  # Hal requires docker config first.
     GoogleConfigurator(),
     KubernetesConfigurator(),
+    KubernetesV2Configurator(),
     JenkinsConfigurator(),
     NotificationConfigurator(),
     SecurityConfigurator(),
     CanaryConfigurator(),
     GcsPubsubNotficationConfigurator(),
-    GooglePubsubConfigurator()
+    GooglePubsubConfigurator(),
+    HaConfigurator()
 ]
 
 

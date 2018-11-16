@@ -26,6 +26,7 @@ from buildtool import (
     DEFAULT_BUILD_NUMBER,
     BranchSourceCodeManager,
     GitRepositorySpec,
+    MetricsManager,
     RepositorySummary,
     SourceInfo)
 import buildtool
@@ -47,15 +48,15 @@ from test_util import (
     BaseGitRepoTestFixture,
     init_runtime)
 
-
 def load_default_bom_dependencies():
   path = os.path.join(os.path.dirname(__file__),
                       '../../dev/buildtool/bom_dependencies.yml')
   with open(path, 'r') as stream:
-    return yaml.load(stream.read())
+    return yaml.safe_load(stream.read())
 
 def make_default_options(options):
   options.git_branch = 'OptionBranch'
+  options.github_hostname = 'test-hostname'
   options.github_owner = 'test-user'
   options.bom_dependencies_path = None
   options.build_number = 'OptionBuildNumber'
@@ -84,7 +85,7 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
 
     options = self.parser.parse_args(['build_bom'])
     option_dict = vars(options)
-    self.assertEquals(DEFAULT_BUILD_NUMBER, options.build_number)
+    self.assertEqual(DEFAULT_BUILD_NUMBER, options.build_number)
 
     for key in ['bom_path', 'github_owner']:
       self.assertIsNone(option_dict[key])
@@ -103,7 +104,7 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
     for key, value in defaults.items():
       if key in ['not_used', 'command', 'input_dir', 'output_dir']:
         continue
-      self.assertEquals(value, parsed_option_dict[key])
+      self.assertEqual(value, parsed_option_dict[key])
 
   def test_bom_command(self):
     """Make sure when we run "build_bom" we actually get what we meant."""
@@ -115,7 +116,7 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
                      'bintray_debian_repository': 'TestDebianRepo',
                      'docker_registry': 'TestDockerRegistry',
                      'publish_gce_image_project': 'TestGceProject'})
-    del defaults['github_filesystem_root']
+    del defaults['github_repository_root']
     parser = argparse.ArgumentParser()
     registry = bomtool_main.make_registry([buildtool.bom_commands],
                                           parser, defaults)
@@ -138,9 +139,6 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
     # When the base command ensures the local repository exists, we'll
     # intercept that call and do nothing rather than the git checkouts, etc.
     make_fake(BranchSourceCodeManager, 'ensure_local_repository')
-    mock_remote = self.patch_function('buildtool.branch_scm.GitRunner'
-                                      '.query_remote_repository_commit_id')
-    mock_remote.return_value = 'CommitA'
 
     # When the base command asks for the repository metadata, we'll return
     # this hardcoded info, then look for it later in the generated om.
@@ -161,7 +159,7 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
     command()
 
     # Verify source repositories were filtered
-    self.assertEquals([test_repository], command.source_repositories)
+    self.assertEqual([test_repository], command.source_repositories)
 
     # Verify that the filter was called with the original bom repos,
     # and these repos were coming from the configured github_owner's repo.
@@ -172,17 +170,15 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
             origin='https://%s/TestOwner/%s' % (options.github_hostname, name),
             upstream='https://github.com/spinnaker/' + name)
         for name in sorted(['clouddriver', 'deck', 'echo', 'fiat', 'front50',
-                            'gate', 'igor', 'kayenta', 'orca', 'rosco', 'spinnaker',
+                            'gate', 'igor', 'kayenta', 'orca', 'rosco',
                             'spinnaker-monitoring'])
     ]
-    mock_remote.assert_called_once_with(test_repository.origin,
-                                        options.git_branch)
     mock_filter.assert_called_once_with(bom_repo_list)
     mock_refresh.assert_called_once_with(test_repository, 'OptionBuildNumber')
     bom_text, bom_path = mock_write.call_args_list[0][0]
 
-    self.assertEquals(bom_path, 'MY PATH')
-    bom = yaml.load(bom_text)
+    self.assertEqual(bom_path, 'MY PATH')
+    bom = yaml.safe_load(bom_text)
 
     golden_text = textwrap.dedent("""\
         artifactSources:
@@ -198,11 +194,11 @@ class TestBuildBomCommand(BaseGitRepoTestFixture):
         timestamp: '2018-01-02 03:04:05'
         version: OptionBranch-OptionBuildNumber
     """)
-    golden_bom = yaml.load(golden_text)
+    golden_bom = yaml.safe_load(golden_text)
     golden_bom['dependencies'] = load_default_bom_dependencies()
 
     for key, value in golden_bom.items():
-      self.assertEquals(value, bom[key])
+      self.assertEqual(value, bom[key])
 
 
 class TestBomBuilder(BaseGitRepoTestFixture):
@@ -216,14 +212,14 @@ class TestBomBuilder(BaseGitRepoTestFixture):
     self.scm = BranchSourceCodeManager(self.options, self.test_root)
 
   def test_default_build(self):
-    builder = BomBuilder(self.options, self.scm)
+    builder = BomBuilder(self.options, self.scm, MetricsManager.singleton())
     bom = builder.build()
-    self.assertEquals(
+    self.assertEqual(
         bom['dependencies'], load_default_bom_dependencies())
 
     # There are no services because we never added any.
     # Although the builder takes an SCM, you still need to explicitly add repos.
-    self.assertEquals({}, bom['services'])
+    self.assertEqual({}, bom['services'])
 
   def test_inject_dependencies(self):
     dependencies = {
@@ -233,19 +229,19 @@ class TestBomBuilder(BaseGitRepoTestFixture):
     fd, path = tempfile.mkstemp(prefix='bomdeps')
     os.close(fd)
     with open(path, 'w') as stream:
-      yaml.dump(dependencies, stream)
+      yaml.safe_dump(dependencies, stream)
 
     options = self.options
     options.bom_dependencies_path = path
 
     try:
-      builder = BomBuilder(options, self.scm)
+      builder = BomBuilder(options, self.scm, MetricsManager.singleton())
       bom = builder.build()
     finally:
       os.remove(path)
 
-    self.assertEquals(dependencies, bom['dependencies'])
-    self.assertEquals({}, bom['services'])
+    self.assertEqual(dependencies, bom['dependencies'])
+    self.assertEqual({}, bom['services'])
 
   def test_build(self):
     test_root = self.test_root
@@ -256,7 +252,8 @@ class TestBomBuilder(BaseGitRepoTestFixture):
 
     scm = BranchSourceCodeManager(options, test_root)
     golden_bom = dict(self.golden_bom)
-    builder = BomBuilder.new_from_bom(options, scm, golden_bom)
+    builder = BomBuilder.new_from_bom(
+      options, scm, MetricsManager.singleton(), golden_bom)
     source_repositories = [scm.make_repository_spec(name)
                            for name in ALL_STANDARD_TEST_BOM_REPO_NAMES]
     for repository in source_repositories:
@@ -287,10 +284,10 @@ class TestBomBuilder(BaseGitRepoTestFixture):
     }
 
     for key, value in bom['services'].items():
-      self.assertEquals(value, golden_bom['services'][key])
+      self.assertEqual(value, golden_bom['services'][key])
     for key, value in bom.items():
-      self.assertEquals(value, golden_bom[key])
-    self.assertEquals(golden_bom, bom)
+      self.assertEqual(value, golden_bom[key])
+    self.assertEqual(golden_bom, bom)
 
   def test_rebuild(self):
     test_root = self.test_root
@@ -301,7 +298,8 @@ class TestBomBuilder(BaseGitRepoTestFixture):
     options.build_number = 'UpdatedBuildNumber'
 
     scm = BranchSourceCodeManager(options, test_root)
-    builder = BomBuilder.new_from_bom(options, scm, self.golden_bom)
+    builder = BomBuilder.new_from_bom(
+      options, scm, MetricsManager.singleton(), self.golden_bom)
 
     repository = scm.make_repository_spec(OUTLIER_REPO)
     scm.ensure_git_path(repository)
@@ -315,7 +313,7 @@ class TestBomBuilder(BaseGitRepoTestFixture):
       bom = builder.build()
 
     updated_service = bom['services'][OUTLIER_SERVICE]
-    self.assertEquals(updated_service, {
+    self.assertEqual(updated_service, {
         'commit': self.repo_commit_map[OUTLIER_REPO][PATCH_BRANCH],
         'version': PATCH_VERSION_NUMBER + '-SourceInfoBuildNumber'
         })
@@ -334,12 +332,12 @@ class TestBomBuilder(BaseGitRepoTestFixture):
         'gitPrefix': self.golden_bom['artifactSources']['gitPrefix']
     }
     for key, value in updated_bom.items():
-      self.assertEquals(value, bom[key])
-    self.assertEquals(updated_bom, bom)
+      self.assertEqual(value, bom[key])
+    self.assertEqual(updated_bom, bom)
 
   def test_determine_most_common_prefix(self):
     options = self.options
-    builder = BomBuilder(options, self.scm)
+    builder = BomBuilder(options, self.scm, MetricsManager.singleton())
     self.assertIsNone(builder.determine_most_common_prefix())
 
     prefix = ['http://github.com/one', '/local/source/path/two']
@@ -354,7 +352,7 @@ class TestBomBuilder(BaseGitRepoTestFixture):
                                   '1.2.3', '1.2.2', [])
       source_info = SourceInfo('BuildOne', summary)
       builder.add_repository(repository, source_info)
-      self.assertEquals(prefix[0], builder.determine_most_common_prefix())
+      self.assertEqual(prefix[0], builder.determine_most_common_prefix())
 
       repository = GitRepositorySpec(
           'RepoTwo', origin=prefix[which] + '/RepoTwo',
@@ -371,7 +369,7 @@ class TestBomBuilder(BaseGitRepoTestFixture):
                                   '3.2.0', '2.2.1', [])
       source_info = SourceInfo('BuildThree', summary)
       builder.add_repository(repository, source_info)
-      self.assertEquals(prefix[which], builder.determine_most_common_prefix())
+      self.assertEqual(prefix[which], builder.determine_most_common_prefix())
 
 
 if __name__ == '__main__':
